@@ -237,6 +237,11 @@ SOBOLEV_ENABLED  = False  # toggled interactively at startup
 SOBOLEV_WEIGHT   = 0.3
 SOBOLEV_KNN_K    = 15
 
+# ---- Self-adaptive mutation sigma (ES meta-learning) ----
+SIGMA_TAU = 0.15    # meta-learning rate for log-normal sigma adaptation
+SIGMA_MIN = 0.5     # lower bound on individual sigma
+SIGMA_MAX = 20.0    # upper bound on individual sigma
+
 # ---- Adaptive Complexity Frequency Parsimony (PySR: use_frequency) ----
 # Measure how often each complexity level appears in the population and add a
 # log-frequency penalty so over-crowded complexities are gently discouraged.
@@ -6557,12 +6562,6 @@ def evolve_island_chunk(args):
     local_hof  = HallOfFame()
     local_stag = current_stag
 
-    # ── Meta-learning rate for self-adaptive sigma ────────────────────────
-    # τ = 1 / sqrt(2·sqrt(n_active)) is the canonical ES recommendation.
-    # We use a fixed approximation tuned for typical CGP active sizes.
-    SIGMA_TAU     = 0.15    # meta-learning rate
-    SIGMA_MIN     = 0.5
-    SIGMA_MAX     = 20.0
     MACRO_P_GROW  = 0.07    # probability of grow macro-mutation per step (was 0.05)
     MACRO_P_PRUNE = 0.04    # probability of prune macro-mutation per step (was 0.05)
     MACRO_P_GRAFT = 0.06    # probability of feature-graft macro-mutation per step
@@ -7043,9 +7042,6 @@ def evolve_afpo(population, X, y_target, type_code,
     bg_logits / class_idx_in_group / Y_group: forwarded to all fitness calls
     for joint softmax CE when this output belongs to a multi-class group.
     """
-    SIGMA_TAU     = 0.15
-    SIGMA_MIN     = 0.5
-    SIGMA_MAX     = 20.0
     MACRO_P_GROW  = 0.07    # was 0.05
     MACRO_P_PRUNE = 0.04    # was 0.05
     MACRO_P_GRAFT = 0.06    # feature-graft macro-mutation
