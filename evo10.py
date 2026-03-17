@@ -4551,7 +4551,7 @@ def crossover(parent1_eq, parent2_eq):
 # PART 4d: MACRO-MUTATIONS & EVOLUTION HELPERS
 # ==========================================
 
-def macro_grow(cgp_eq, n_features, feature_names):
+def macro_grow(cgp_eq, n_features, feature_names, op_affinity=None):
     """
     Grow macro-mutation: increase active complexity by exactly one node.
 
@@ -4565,6 +4565,9 @@ def macro_grow(cgp_eq, n_features, feature_names):
     The new node is placed in the lowest available inactive slot that lies
     *after* all currently active slots (so the forward-reference constraint
     is never violated).
+
+    If *op_affinity* is provided, operator selection is biased toward ops
+    that appear in HoF expressions (same system used by mutate()).
     """
     child  = copy.deepcopy(cgp_eq)
     active = sorted(i for i in child.active_nodes if i >= n_features)
@@ -4593,9 +4596,16 @@ def macro_grow(cgp_eq, n_features, feature_names):
     if len(active) < 2 and not unary_ops:
         return child
 
+    def _affinity_choice(ops):
+        """Pick op from *ops* weighted by affinity if available, else uniform."""
+        if op_affinity and len(ops) > 1:
+            weights = [op_affinity.get(o, 1.0) for o in ops]
+            return random.choices(ops, weights=weights, k=1)[0]
+        return random.choice(ops)
+
     if (random.random() < 0.60 or len(active) < 2 or not binary_ops) and unary_ops:
         # Strategy A: wrap current output with a unary op
-        op = random.choice(unary_ops)
+        op = _affinity_choice(unary_ops)
         child.nodes[dst_idx] = CGPNode(op, child.out_idx, child.out_idx,
                                        random.gauss(0, 1.0))
         child.out_idx = dst
@@ -4650,7 +4660,7 @@ def macro_grow(cgp_eq, n_features, feature_names):
                     break  # perfect: completely different feature lineages
 
         s1, s2 = best_s1, best_s2
-        op = random.choice(binary_ops)
+        op = _affinity_choice(binary_ops)
         child.nodes[dst_idx] = CGPNode(op, s1, s2, random.gauss(0, 1.0))
         child.out_idx = dst
 
@@ -6234,29 +6244,28 @@ def tournament_select(population, k=3):
 def epsilon_lexicase_selection(population, X, y_target, type_code, n_cases=20,
                                bg_logits=None, class_idx_in_group=None, Y_group=None):
     """
-    Down-Sampled epsilon-lexicase selection (DS-Lexicase).
+    Down-Sampled epsilon-lexicase selection with MAD-based adaptive epsilon.
+
+    Uses the Median Absolute Deviation (MAD) of per-case errors across the
+    population to set epsilon, following Helmuth et al.'s recommendation for
+    automatic epsilon scaling.  This adapts to the population's actual error
+    distribution rather than using a fixed 5% relative threshold:
+      - Early evolution (large error spread): epsilon is large → more diversity
+      - Late evolution (tight error spread): epsilon is small → sharper selection
 
     If DS_LEXICASE_FRAC > 0, each call randomly sub-samples that fraction of
     the dataset (minimum 20 cases) as the case pool for this generation.
-    The sub-sample changes every generation, preventing the population from
-    overfitting to specific edge cases while keeping the diversity-preserving
-    benefits of lexicase at a fraction of the compute cost.
-
-    If DS_LEXICASE_FRAC == 0 (default), falls back to the original behaviour
-    of sampling n_cases random cases from the full dataset.
 
     bg_logits / class_idx_in_group / Y_group are forwarded to get_case_errors
     for joint softmax mode.
     """
-    pool = list(population)  # Lexicase should always filter the whole population
+    pool = list(population)
 
     N = X.shape[0]
     if DS_LEXICASE_FRAC > 0.0:
-        # Down-sampled: sub-sample fraction of dataset, minimum 20
         n_subsample = max(20, int(DS_LEXICASE_FRAC * N))
         subsample_idx = np.random.choice(N, min(N, n_subsample), replace=False)
     else:
-        # Original: random n_cases from full dataset
         subsample_idx = np.random.choice(N, min(N, n_cases), replace=False)
 
     # Shuffle case order (standard lexicase randomises the case sequence)
@@ -6269,8 +6278,17 @@ def epsilon_lexicase_selection(population, X, y_target, type_code, n_cases=20,
                                       Y_group=Y_group)[0]
                   for ind in pool]
         best_err = min(errors)
-        epsilon  = best_err + abs(best_err) * 0.05 + 1e-6
-        pool     = [ind for ind, err in zip(pool, errors) if err <= epsilon]
+        # MAD-based adaptive epsilon: median absolute deviation of errors
+        # across the population for this case.  Falls back to 5% relative
+        # if the MAD is degenerate (all individuals have the same error).
+        err_arr = np.array(errors)
+        mad = float(np.median(np.abs(err_arr - np.median(err_arr))))
+        if mad > 1e-10:
+            epsilon = best_err + mad
+        else:
+            # Degenerate: all errors are nearly identical, use small relative
+            epsilon = best_err + abs(best_err) * 0.05 + 1e-6
+        pool = [ind for ind, err in zip(pool, errors) if err <= epsilon]
         if len(pool) == 1:
             break
 
@@ -6303,7 +6321,7 @@ def macro_rational_grow(cgp_eq, n_features):
     new_op_slot = free[1]
     
     # Inject a new constant and a + or * node into the denominator path
-    child.nodes[new_const_slot - n_features] = CGPNode('const', 0, 0, 10.0)
+    child.nodes[new_const_slot - n_features] = CGPNode('const', 0, 0, random.gauss(0, 1.0))
     child.nodes[new_op_slot - n_features] = CGPNode(random.choice(['+', '*']), node.in2, new_const_slot)
     
     # Rewire the division to use the new compound denominator
@@ -6469,7 +6487,8 @@ def _create_offspring(action, parent, population, n_features, feat_names,
             (parent_sigma + p2_sigma) / 2.0 * np.exp(random.gauss(0, SIGMA_TAU * 0.5)),
             SIGMA_MIN, SIGMA_MAX))
     elif action == 'grow':
-        child_tree = macro_grow(parent.tree, n_features, feat_names)
+        child_tree = macro_grow(parent.tree, n_features, feat_names,
+                                op_affinity=op_affinity)
     elif action == 'prune':
         child_tree = macro_prune(parent.tree, n_features)
     elif action == 'graft':
@@ -6480,6 +6499,8 @@ def _create_offspring(action, parent, population, n_features, feat_names,
         child_tree = macro_rational_grow(parent.tree, n_features)
     elif action == 'trig':
         child_tree = macro_trig_identity(parent.tree, n_features)
+    elif action == 'ablate':
+        child_tree = macro_ablate_feature(parent.tree, n_features)
     else:  # mutate
         child_tree = mutate(parent.tree, n_features, feat_names,
                             mut_rate=eff_rate, temperature=sa_temp,
@@ -6548,8 +6569,8 @@ def evolve_island_chunk(args):
 
     # ── IMPROVEMENT: Adaptive reproductive operator tracker ────────────────
     # Tracks which operators produce accepted children; adapts weights over time.
-    _repro_ops_base = ['mutate', 'crossover', 'grow', 'prune', 'graft', 'optimize', 'do_nothing', 'div', 'trig']
-    _repro_weights_base = [4.0, 1.0, 0.5, 0.5, 0.5, 1.5, 0.5, 0.5, 0.8]
+    _repro_ops_base = ['mutate', 'crossover', 'grow', 'prune', 'graft', 'optimize', 'do_nothing', 'div', 'trig', 'ablate']
+    _repro_weights_base = [4.0, 1.0, 0.5, 0.5, 0.5, 1.5, 0.5, 0.5, 0.8, 0.3]
     _mut_tracker = AdaptiveMutationTracker(_repro_ops_base, _repro_weights_base, alpha=0.07)
 
     # ── IMPROVEMENT: Operator affinity (updated every 200 gens) ───────────
@@ -6577,13 +6598,10 @@ def evolve_island_chunk(args):
         freq_adj = compute_complexity_frequency_adjustment(island_pop)
 
         # ── Adaptive stagnation multiplier ───────────────────────────────
+        # Smooth sigmoid stagnation multiplier: ramps continuously from 1× to 4×
+        # as stagnation progresses, avoiding the abrupt jumps of discrete levels.
         stag_frac = local_stag / max(ext_patience, 1)
-        if stag_frac < 0.33:
-            stag_mul = 1.0
-        elif stag_frac < 0.66:
-            stag_mul = 2.0
-        else:
-            stag_mul = 4.0
+        stag_mul = 1.0 + 3.0 / (1.0 + np.exp(-10.0 * (stag_frac - 0.5)))
 
         # ── IMPROVEMENT: Periodic light constant optimisation ─────────────────
         # Every _LIGHT_CONST_OPT_FREQ generations, run a quick L-BFGS-B polish
@@ -6704,10 +6722,13 @@ def evolve_island_chunk(args):
                 _mut_tracker.record(action, success=False)
             # else: child rejected, victim stays (population unchanged)
         else:
-            # SA disabled or temperature is negligible — greedy acceptance
-            island_pop.remove(victim)
-            island_pop.append(child)
-            _mut_tracker.record(action, success=delta_fit < 0)
+            # SA disabled or temperature is negligible — strict greedy acceptance
+            if delta_fit <= 0:
+                island_pop.remove(victim)
+                island_pop.append(child)
+                _mut_tracker.record(action, success=True)
+            else:
+                _mut_tracker.record(action, success=False)
 
         # 6. HoF update & stagnation tracking
         child_freq_adj = freq_adj.get(int(round(child.complexity)), 0.0)
@@ -7029,6 +7050,12 @@ def evolve_afpo(population, X, y_target, type_code,
     MACRO_P_PRUNE = 0.04    # was 0.05
     MACRO_P_GRAFT = 0.06    # feature-graft macro-mutation
 
+    # ── Adaptive reproductive operator tracker (same as island model) ─────
+    _repro_ops_base = ['mutate', 'crossover', 'grow', 'prune', 'graft',
+                       'optimize', 'do_nothing', 'div', 'trig', 'ablate']
+    _repro_weights_base = [4.0, 1.0, 0.5, 0.5, 0.5, 1.5, 0.5, 0.5, 0.8, 0.3]
+    _mut_tracker = AdaptiveMutationTracker(_repro_ops_base, _repro_weights_base, alpha=0.07)
+
     local_stag = stag_counter
     # Track the best individual seen inside this chunk for champion protection
     _chunk_champion = min(population, key=lambda x: x.loss) if population else None
@@ -7064,13 +7091,10 @@ def evolve_afpo(population, X, y_target, type_code,
         # ── PySR adaptive complexity frequency parsimony ──────────────────────
         freq_adj = compute_complexity_frequency_adjustment(population)
 
+        # Smooth sigmoid stagnation multiplier: ramps continuously from 1× to 4×
+        # as stagnation progresses, avoiding the abrupt jumps of discrete levels.
         stag_frac = local_stag / max(ext_patience, 1)
-        if stag_frac < 0.33:
-            stag_mul = 1.0
-        elif stag_frac < 0.66:
-            stag_mul = 2.0
-        else:
-            stag_mul = 4.0
+        stag_mul = 1.0 + 3.0 / (1.0 + np.exp(-10.0 * (stag_frac - 0.5)))
 
         parent       = epsilon_lexicase_selection(population, X, y_target, type_code,
                                                   bg_logits=bg_logits,
@@ -7083,12 +7107,10 @@ def evolve_afpo(population, X, y_target, type_code,
         eff_rate = max(1, round(np.random.poisson(max(0.1, child_sigma * stag_mul))))
 
         # ------------------------------------------------------------------ #
-        # PySR-Style Top-Level Operator Action Selection
+        # PySR-Style Top-Level Operator Action Selection (adaptive weights)
         # ------------------------------------------------------------------ #
-        _afpo_repro_ops = ['mutate', 'crossover', 'grow', 'prune', 'graft',
-                           'optimize', 'do_nothing', 'div', 'trig']
-        _afpo_repro_weights = [4.0, 1.0, 0.5, 0.5, 0.5, 1.5, 0.5, 0.5, 0.8]
-        action = random.choices(_afpo_repro_ops, weights=_afpo_repro_weights, k=1)[0]
+        repro_weights = _mut_tracker.get_weights()
+        action = random.choices(_repro_ops_base, weights=repro_weights, k=1)[0]
 
         child_tree, child_sigma = _create_offspring(
             action, parent, population, n_features, feat_names,
@@ -7098,9 +7120,6 @@ def evolve_afpo(population, X, y_target, type_code,
         child.sigma = child_sigma
         child.age   = 0    # AFPO invariant
 
-        # ------------------------------------------------------------------ #
-        # Fitness Calculation & Fast Optimization Action
-        # ------------------------------------------------------------------ #
         # ------------------------------------------------------------------ #
         # Fitness Calculation & Fast Optimization Action
         # ------------------------------------------------------------------ #
@@ -7124,6 +7143,8 @@ def evolve_afpo(population, X, y_target, type_code,
 
         population.append(child)
         population = _trim_to_pareto_front_3obj(population, target_size)
+        # Track whether the child survived the Pareto trim
+        _mut_tracker.record(action, success=(child in population))
 
         # ── Complexity budget cap ─────────────────────────────────────────────
         # Prevent unbounded memory growth: if total active-node count across
@@ -7139,14 +7160,8 @@ def evolve_afpo(population, X, y_target, type_code,
                    and sum(ind.complexity for ind in population) > _COMPLEXITY_BUDGET):
                 population.pop(0)  # remove most complex
 
-        child_freq_adj = freq_adj.get(int(round(child.complexity)), 0.0)
-        child.calculate_fitness(X, y_target, type_code,
-                                bg_logits=bg_logits,
-                                class_idx_in_group=class_idx_in_group,
-                                Y_group=Y_group,
-                                freq_parsimony_adj=child_freq_adj,
-                                update_affine=False,
-                                target_grads=target_grads)
+        # HoF update uses .loss (not .fitness), so no need to re-evaluate
+        # with freq_parsimony_adj — the loss is already correct from above.
         if hof.update(child):
             local_stag = 0
         else:
@@ -9717,17 +9732,18 @@ def train_mode():
         for island_idx in range(NUM_ISLANDS):
             for i in range(n_outputs):
                 pop = generate_seeds_v5(n_features, feat_names)
-                # Add feature-importance-biased seeds for first island per output
-                if island_idx == 0:
-                    try:
-                        imp_seeds = generate_importance_biased_seeds(
-                            n_features, feat_names, X_init, Y_init[:, i])
-                        pop.extend(imp_seeds)
-                        if imp_seeds:
-                            print(f"    [Importance] {len(imp_seeds)} data-driven seeds "
-                                  f"for output {i}")
-                    except Exception:
-                        pass
+                # Add feature-importance-biased seeds for every island (not
+                # just island 0) so all islands benefit from data-driven
+                # initialization rather than relying solely on generic templates.
+                try:
+                    imp_seeds = generate_importance_biased_seeds(
+                        n_features, feat_names, X_init, Y_init[:, i])
+                    pop.extend(imp_seeds)
+                    if imp_seeds and island_idx == 0:
+                        print(f"    [Importance] {len(imp_seeds)} data-driven seeds "
+                              f"for output {i}")
+                except Exception:
+                    pass
                 while len(pop) < ISLAND_SIZE:
                     pop.append(Individual(random_cgp(n_features, CGP_NODES, feat_names)))
                 for ind in pop:
@@ -9851,16 +9867,28 @@ def train_mode():
 
                     gen += MIGRATION_FREQ
 
-                    # ---- Island migration (ring topology) ----
+                    # ---- Island migration (diverse ring topology) ----
+                    # Select up to 2 diverse migrants per island (best-loss +
+                    # most phenotypically unique) instead of single-best, for
+                    # better cross-island diversity transfer.
+                    _mig_probe_idx = np.random.choice(
+                        X.shape[0], min(16, X.shape[0]), replace=False)
+                    _X_mig_probe = X[_mig_probe_idx]
                     for i in range(n_outputs):
                         for island_idx in range(NUM_ISLANDS):
                             next_island = (island_idx + 1) % NUM_ISLANDS
-                            migrant = min(islands_pop[island_idx][i], key=lambda x: x.fitness)
-                            migrant_copy = copy.deepcopy(migrant)
-                            migrant_copy.age = 0
+                            src_pop = islands_pop[island_idx][i]
+                            n_mig = min(2, max(1, len(src_pop) // 25))
+                            migrants = _select_diverse_migrants(
+                                src_pop, n_migrants=n_mig, X_probe=_X_mig_probe)
                             target_pop = islands_pop[next_island][i]
-                            target_pop.remove(random.choice(target_pop))
-                            target_pop.append(migrant_copy)
+                            for mig in migrants:
+                                mig_copy = copy.deepcopy(mig)
+                                mig_copy.age = 0
+                                # Replace worst individual in target
+                                worst = max(target_pop, key=lambda x: x.fitness)
+                                target_pop.remove(worst)
+                                target_pop.append(mig_copy)
 
                     print(f"--- Generation {gen} ---")
 
@@ -10134,6 +10162,12 @@ def train_mode():
         for island_idx in range(NUM_ISLANDS):
             for i in range(n_outputs):
                 pop = generate_seeds_v5(n_features, feat_names)
+                try:
+                    imp_seeds = generate_importance_biased_seeds(
+                        n_features, feat_names, X_init, Y_init[:, i])
+                    pop.extend(imp_seeds)
+                except Exception:
+                    pass
                 while len(pop) < AFPO_POP_SIZE:
                     pop.append(Individual(random_cgp(n_features, CGP_NODES, feat_names)))
                 for ind in pop:
@@ -10430,6 +10464,12 @@ def train_mode():
             for isl in range(N_ISL_PER_G):
                 for i in range(n_outputs):
                     pop = generate_seeds_v5(n_features, feat_names)
+                    try:
+                        imp_seeds = generate_importance_biased_seeds(
+                            n_features, feat_names, X_init, Y_init[:, i])
+                        pop.extend(imp_seeds)
+                    except Exception:
+                        pass
                     while len(pop) < AFPO_POP_SIZE:
                         pop.append(Individual(random_cgp(n_features, CGP_NODES, feat_names)))
                     for ind in pop:
