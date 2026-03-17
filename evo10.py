@@ -6349,7 +6349,84 @@ def tree_to_sympy(cgp_eq, feature_vars, safe=None):
     return buf.get(cgp_eq.out_idx, sympy.Float(0))
 
 
-def generate_script(models, dp, filename="best_model.py"):
+# ═══════════════════════════════════════════════════════════════════════════════
+# PERFECT OUTPUT EARLY STOPPING
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Thresholds for "perfect" performance
+_PERFECT_R2_THRESHOLD = 1.0 - 1e-9       # R² >= this is considered perfect
+_PERFECT_MSE_THRESHOLD = 1e-10            # MSE <= this is considered near-zero
+_PERFECT_ACCURACY_THRESHOLD = 1.0 - 1e-9  # accuracy >= this for classification
+
+
+def _check_output_perfect(hof, X, Y_col, out_type):
+    """Check if the best model for this output has effectively perfect performance.
+
+    Returns (is_perfect, best_ind) where is_perfect is True if R²≈1 and MSE≈0
+    (regression) or accuracy≈1 (classification).
+    """
+    best = hof.get_best_overall()
+    if best is None:
+        return False, None
+
+    is_cls = (out_type == 6)
+    if is_cls:
+        acc = getattr(best, 'accuracy', 0.0)
+        return acc >= _PERFECT_ACCURACY_THRESHOLD, best
+
+    # Regression: check R² and MSE
+    r2 = getattr(best, 'r2', 0.0)
+    if r2 < _PERFECT_R2_THRESHOLD:
+        return False, best
+
+    # Double-check with actual MSE on full data
+    pred = best.tree.evaluate(X)
+    pred = np.nan_to_num(pred, nan=0.0, posinf=1e9, neginf=-1e9)
+    a = getattr(best, 'affine_a', 1.0)
+    b = getattr(best, 'affine_b', 0.0)
+    pred = a * pred + b
+    mse = float(np.mean((Y_col - pred) ** 2))
+    return mse <= _PERFECT_MSE_THRESHOLD, best
+
+
+def _save_backup_model(models, dp, output_idx, X_data=None):
+    """Save a backup model script for a single perfect output."""
+    out_label = dp.output_map[output_idx] if output_idx < len(dp.output_map) else f"Out{output_idx}"
+    safe_label = re.sub(r'[^a-zA-Z0-9_]', '_', out_label)
+    filename = f"backup_perfect_{safe_label}.py"
+    generate_script(models, dp, filename=filename, X_data=X_data)
+    print(f"  [Perfect] Backup model saved to: {filename}")
+
+
+def _simplify_perfect_output(hof, X, Y_col, out_type, target_grads=None):
+    """Run aggressive simplification on a perfect output's HoF,
+    trying to reduce complexity while keeping perfect performance."""
+    if sympy is None:
+        return
+
+    improved = False
+    for complexity, ind in list(hof.best_by_complexity.items()):
+        try:
+            # Try sympy simplification on the tree
+            clean_names = [clean_var_name(n) for n in ind.tree.feature_names]
+            sym_vars = [sympy.Symbol(n) for n in clean_names]
+            raw_sym = tree_to_sympy(ind.tree, sym_vars, safe=SAFE_OPS_MODE)
+            simplified = advanced_simplify_expr(raw_sym)
+
+            # If simplification actually reduced expression size, rebuild
+            if str(simplified) != str(raw_sym):
+                # Re-evaluate to make sure performance is maintained
+                ind_copy = copy.deepcopy(ind)
+                ind_copy.calculate_fitness(X, Y_col, out_type, target_grads=target_grads)
+                if ind_copy.loss < 1e-5:
+                    hof.update(ind_copy)
+                    improved = True
+        except Exception:
+            continue
+    return improved
+
+
+def generate_script(models, dp, filename="best_model.py", X_data=None):
     import inspect
 
     out_types = dp.get_output_types_flat()
@@ -6524,6 +6601,15 @@ def generate_script(models, dp, filename="best_model.py"):
     )
 
     # ------------------------------------------------------------------ #
+    # 2b. Compute feature ranges for plotting
+    # ------------------------------------------------------------------ #
+    feature_ranges = {}  # idx -> (min, max, mean)
+    if X_data is not None:
+        for idx in range(len(final_vars)):
+            col = X_data[:, idx]
+            feature_ranges[idx] = (float(np.nanmin(col)), float(np.nanmax(col)), float(np.nanmean(col)))
+
+    # ------------------------------------------------------------------ #
     # 3. Embed DataProcessor source so pickle can find the class.
     # ------------------------------------------------------------------ #
     try:
@@ -6537,6 +6623,8 @@ def generate_script(models, dp, filename="best_model.py"):
     dp_class_src = "\n".join(
         line for line in dp_class_src.splitlines()
     )
+
+    output_names_list = [dp.output_map[i] if i < len(dp.output_map) else f"Out{i}" for i in range(len(models))]
 
     script_content = f'''import numpy as np
 import pandas as pd
@@ -6571,9 +6659,33 @@ math.erf = _erf_vec
 # ─────────────────────────────────────────────────────────────────────────────
 
 USED_COLS = {repr(used_cols)}
+FEATURE_NAMES = {repr(final_vars)}
+FEATURE_RANGES = {repr(feature_ranges)}
+OUTPUT_NAMES = {repr(output_names_list)}
+N_FEATURES = {len(final_vars)}
+N_OUTPUTS = {len(models)}
 
 DP_B64 = "{dp_b64}"
 dp = pickle.loads(base64.b64decode(DP_B64))
+
+
+def predict_raw(X):
+    """Predict from a raw numpy array of shape (N, n_features).
+    Skips DataProcessor preprocessing — use when data is already transformed.
+    """
+    _X_mat = np.asarray(X, dtype=float)
+    if _X_mat.ndim == 1:
+        _X_mat = _X_mat.reshape(1, -1)
+    N = _X_mat.shape[0]
+
+{unpack_code}
+
+    n_outputs = N_OUTPUTS
+    y_pred = np.zeros((N, n_outputs))
+
+{eq_code}
+
+    return y_pred
 
 
 def predict(input_dict):
@@ -6586,7 +6698,7 @@ def predict(input_dict):
 
 {unpack_code}
 
-    n_outputs = {len(models)}
+    n_outputs = N_OUTPUTS
     y_pred = np.zeros((1, n_outputs))
 
 {eq_code}
@@ -6594,11 +6706,139 @@ def predict(input_dict):
     return dp.inverse_transform_output(y_pred[0])
 
 
+def plot_model():
+    """Interactive plotting of model outputs vs inputs (1D and 2D)."""
+    try:
+        import matplotlib
+        matplotlib.use("TkAgg")
+    except Exception:
+        pass
+    try:
+        import matplotlib.pyplot as plt
+        from matplotlib import cm
+    except ImportError:
+        print("matplotlib is required for plotting. Install with: pip install matplotlib")
+        return
+
+    if not FEATURE_RANGES:
+        print("No feature range data available (model was saved without training data).")
+        return
+
+    n_feat = N_FEATURES
+    n_out = N_OUTPUTS
+    resolution = 200
+
+    # Build defaults
+    feat_defaults = {{}}
+    feat_mins = {{}}
+    feat_maxs = {{}}
+    for idx_str, (fmin, fmax, fmean) in FEATURE_RANGES.items():
+        idx = int(idx_str) if isinstance(idx_str, str) else idx_str
+        feat_defaults[idx] = fmean
+        feat_mins[idx] = fmin
+        feat_maxs[idx] = fmax
+
+    print("\\n--- MODEL PLOTTING ---")
+    print(f"Features ({{n_feat}}): {{', '.join(FEATURE_NAMES)}}")
+    print(f"Outputs  ({{n_out}}): {{', '.join(OUTPUT_NAMES)}}")
+
+    # Ask user for custom frozen values
+    print("\\nFrozen input defaults (mean of training data):")
+    for idx in range(n_feat):
+        print(f"  {{FEATURE_NAMES[idx]}}: {{feat_defaults.get(idx, 0.0):.4g}}"
+              f"  (range: {{feat_mins.get(idx, 0.0):.4g}} to {{feat_maxs.get(idx, 0.0):.4g}})")
+    custom = input("\\nCustomize frozen values? [y/N]: ").strip().lower()
+    if custom == 'y':
+        for idx in range(n_feat):
+            val = input(f"  {{FEATURE_NAMES[idx]}} [{{feat_defaults.get(idx, 0.0):.4g}}]: ").strip()
+            if val:
+                try:
+                    feat_defaults[idx] = float(val)
+                except ValueError:
+                    pass
+
+    # 1D plots: each feature vs each output
+    print("\\nGenerating 1D plots (each input vs each output)...")
+    for feat_idx in range(n_feat):
+        fmin = feat_mins.get(feat_idx, 0.0)
+        fmax = feat_maxs.get(feat_idx, 1.0)
+        if abs(fmax - fmin) < 1e-12:
+            continue  # skip constant features
+        x_range = np.linspace(fmin, fmax, resolution)
+        X_grid = np.tile([feat_defaults.get(i, 0.0) for i in range(n_feat)], (resolution, 1))
+        X_grid[:, feat_idx] = x_range
+        y_pred = predict_raw(X_grid)
+
+        for out_idx in range(n_out):
+            fig, ax = plt.subplots(figsize=(8, 5))
+            ax.plot(x_range, y_pred[:, out_idx], linewidth=2)
+            frozen_str = ", ".join(
+                f"{{FEATURE_NAMES[i]}}={{feat_defaults.get(i, 0.0):.3g}}"
+                for i in range(n_feat) if i != feat_idx)
+            ax.set_xlabel(FEATURE_NAMES[feat_idx])
+            ax.set_ylabel(OUTPUT_NAMES[out_idx])
+            ax.set_title(f"{{OUTPUT_NAMES[out_idx]}} vs {{FEATURE_NAMES[feat_idx]}}")
+            if frozen_str:
+                ax.text(0.02, 0.98, f"Frozen: {{frozen_str}}", transform=ax.transAxes,
+                        fontsize=7, verticalalignment='top',
+                        bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+            ax.grid(True, alpha=0.3)
+            plt.tight_layout()
+
+    # 2D plots: each pair of features vs each output
+    if n_feat >= 2:
+        print("Generating 2D plots (each input pair vs each output)...")
+        res2d = 80
+        for i in range(n_feat):
+            for j in range(i + 1, n_feat):
+                fmin_i, fmax_i = feat_mins.get(i, 0.0), feat_maxs.get(i, 1.0)
+                fmin_j, fmax_j = feat_mins.get(j, 0.0), feat_maxs.get(j, 1.0)
+                if abs(fmax_i - fmin_i) < 1e-12 or abs(fmax_j - fmin_j) < 1e-12:
+                    continue
+                xi = np.linspace(fmin_i, fmax_i, res2d)
+                xj = np.linspace(fmin_j, fmax_j, res2d)
+                Xi, Xj = np.meshgrid(xi, xj)
+                X_grid = np.tile([feat_defaults.get(k, 0.0) for k in range(n_feat)],
+                                 (res2d * res2d, 1))
+                X_grid[:, i] = Xi.ravel()
+                X_grid[:, j] = Xj.ravel()
+                y_pred = predict_raw(X_grid)
+
+                for out_idx in range(n_out):
+                    Z = y_pred[:, out_idx].reshape(res2d, res2d)
+                    fig, ax = plt.subplots(figsize=(8, 6))
+                    cf = ax.contourf(Xi, Xj, Z, levels=30, cmap='viridis')
+                    plt.colorbar(cf, ax=ax, label=OUTPUT_NAMES[out_idx])
+                    ax.set_xlabel(FEATURE_NAMES[i])
+                    ax.set_ylabel(FEATURE_NAMES[j])
+                    frozen_str = ", ".join(
+                        f"{{FEATURE_NAMES[k]}}={{feat_defaults.get(k, 0.0):.3g}}"
+                        for k in range(n_feat) if k != i and k != j)
+                    title = f"{{OUTPUT_NAMES[out_idx]}} vs {{FEATURE_NAMES[i]}}, {{FEATURE_NAMES[j]}}"
+                    ax.set_title(title)
+                    if frozen_str:
+                        ax.text(0.02, 0.98, f"Frozen: {{frozen_str}}", transform=ax.transAxes,
+                                fontsize=7, verticalalignment='top',
+                                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+                    plt.tight_layout()
+
+    plt.show()
+
+
 def main():
     print("--- MODEL INTERFACE ---")
     print("Required Inputs (unused features omitted):")
     for col in USED_COLS:
         print(f" - {{col}}")
+
+    # Ask if user wants to plot
+    try:
+        do_plot = input("\\nWould you like to plot the model? [y/N]: ").strip().lower()
+        if do_plot == 'y':
+            plot_model()
+    except (KeyboardInterrupt, EOFError):
+        pass
+
     print("\\nEnter values (Ctrl+C to exit):")
     try:
         while True:
@@ -8349,6 +8589,7 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
     print("\nPhase 2: Bayesian optimisation. Ctrl+C to stop.\n")
     iteration = 0
     total_evals = BAYESIAN_INITIAL_SAMPLES * n_outputs
+    perfect_outputs = set()
 
     try:
         while True:
@@ -8359,6 +8600,8 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
             Y_b = Y[batch_idx] if batch_idx is not None else Y
 
             for o_idx in range(n_outputs):
+                if o_idx in perfect_outputs:
+                    continue
                 opt = optimizers[o_idx]
 
                 # ── Generate candidates by mutating top individuals ────────
@@ -8462,16 +8705,36 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
 
             if iteration % 5 == 0:
                 for o_idx in range(n_outputs):
-                    print(f"  [Out {o_idx}] GP: {optimizers[o_idx].summary_str()}")
+                    if o_idx not in perfect_outputs:
+                        print(f"  [Out {o_idx}] GP: {optimizers[o_idx].summary_str()}")
+
+            # ── Perfect output detection ────────────────────────────────
+            for o_idx in range(n_outputs):
+                if o_idx in perfect_outputs:
+                    continue
+                is_perf, best_ind = _check_output_perfect(
+                    hofs[o_idx], X, Y[:, o_idx], out_types[o_idx])
+                if is_perf:
+                    out_label = dp.output_map[o_idx] if o_idx < len(dp.output_map) else f"Out{o_idx}"
+                    print(f"\n  ★ Output {o_idx} ({out_label}) reached PERFECT performance!")
+                    _simplify_perfect_output(
+                        hofs[o_idx], X, Y[:, o_idx], out_types[o_idx],
+                        target_grads=target_grads_list[o_idx])
+                    perfect_outputs.add(o_idx)
+
+            if len(perfect_outputs) == n_outputs:
+                print("\n  ★★★ ALL outputs reached perfect performance! Stopping Bayesian CGP.")
+                break
 
             # ── Periodic frontier display ────────────────────────────────
             if iteration % 25 == 0:
                 for o_idx, hof in enumerate(hofs):
                     out_label = (dp.output_map[o_idx]
                                  if o_idx < len(dp.output_map) else f"Out{o_idx}")
+                    pf_tag = " [PERFECT]" if o_idx in perfect_outputs else ""
                     hof.print_frontier(
                         out_type=out_types[o_idx],
-                        label=f"Output {o_idx} ({out_label})")
+                        label=f"Output {o_idx} ({out_label}){pf_tag}")
                 if X_val is not None and Y_val is not None:
                     _print_validation_metrics(hofs, X_val, Y_val, out_types, dp)
 
@@ -9271,10 +9534,38 @@ def run_gradient_boosted_evolution(X, Y, n_features, n_outputs, feat_names,
                 val_r2 = 1.0 - ss_res_v / ss_tot_v
                 print(f"    Final Validation R²: {val_r2:.6f}")
 
+        # Check if this boosted output reached perfect performance
+        _perf = False
+        if is_binary_cls:
+            _final_proba = boosted.predict(X)
+            _final_pred = (_final_proba >= 0.5).astype(int)
+            _final_acc = float(np.mean(_final_pred == y_target.clip(0, 1).astype(int)))
+            _perf = _final_acc >= _PERFECT_ACCURACY_THRESHOLD
+        else:
+            _y_pred_perf = boosted.predict(X)
+            _mse_perf = float(np.mean((y_target - _y_pred_perf) ** 2))
+            _ss_res_perf = float(np.sum((y_target - _y_pred_perf) ** 2))
+            _ss_tot_perf = float(np.sum((y_target - np.mean(y_target)) ** 2)) + 1e-8
+            _r2_perf = 1.0 - _ss_res_perf / _ss_tot_perf
+            _perf = _r2_perf >= _PERFECT_R2_THRESHOLD and _mse_perf <= _PERFECT_MSE_THRESHOLD
+
+        if _perf:
+            print(f"\n    ★ Output {o_idx} ({out_label}) reached PERFECT boosted performance!")
+            print(f"      Saving backup boosted model...")
+            _generate_boosted_script(boosted_models, dp, X_data=X)
+            out_safe = re.sub(r'[^a-zA-Z0-9_]', '_', out_label)
+            # Also save a dedicated backup
+            try:
+                import shutil
+                shutil.copy("best_boosted_model.py", f"backup_perfect_boosted_{out_safe}.py")
+                print(f"      Backup saved to: backup_perfect_boosted_{out_safe}.py")
+            except Exception:
+                pass
+
     return boosted_models
 
 
-def _generate_boosted_script(boosted_models, dp):
+def _generate_boosted_script(boosted_models, dp, X_data=None):
     """Generate a standalone Python script for gradient-boosted models.
 
     Mirrors the full generate_script() output: embeds the DataProcessor class,
@@ -9518,6 +9809,15 @@ def _generate_boosted_script(boosted_models, dp):
     )
 
     # ------------------------------------------------------------------ #
+    # 2b. Compute feature ranges for plotting
+    # ------------------------------------------------------------------ #
+    feature_ranges = {}
+    if X_data is not None:
+        for idx in range(len(final_vars)):
+            col = X_data[:, idx]
+            feature_ranges[idx] = (float(np.nanmin(col)), float(np.nanmax(col)), float(np.nanmean(col)))
+
+    # ------------------------------------------------------------------ #
     # 3. Embed DataProcessor source so pickle can find the class.
     # ------------------------------------------------------------------ #
     try:
@@ -9531,6 +9831,8 @@ def _generate_boosted_script(boosted_models, dp):
     dp_class_src = "\n".join(
         line for line in dp_class_src.splitlines()
     )
+
+    output_names_list = [dp.output_map[i] if i < len(dp.output_map) else f"Out{i}" for i in range(len(boosted_models))]
 
     script_content = f'''import numpy as np
 import pandas as pd
@@ -9565,6 +9867,11 @@ math.erf = _erf_vec
 # ─────────────────────────────────────────────────────────────────────────────
 
 USED_COLS = {repr(used_cols)}
+FEATURE_NAMES = {repr(final_vars)}
+FEATURE_RANGES = {repr(feature_ranges)}
+OUTPUT_NAMES = {repr(output_names_list)}
+N_FEATURES = {len(final_vars)}
+N_OUTPUTS = {len(boosted_models)}
 
 DP_B64 = "{dp_b64}"
 dp = pickle.loads(base64.b64decode(DP_B64))
@@ -9582,7 +9889,7 @@ def predict(input_dict):
 
 {unpack_code}
 
-    n_outputs = {len(boosted_models)}
+    n_outputs = N_OUTPUTS
     y_pred = np.zeros((N, n_outputs))
 
 {eq_code}
@@ -9601,7 +9908,7 @@ def predict_raw(X):
 
 {unpack_code}
 
-    n_outputs = {len(boosted_models)}
+    n_outputs = N_OUTPUTS
     y_pred = np.zeros((N, n_outputs))
 
 {eq_code}
@@ -9609,11 +9916,139 @@ def predict_raw(X):
     return y_pred
 
 
+def plot_model():
+    """Interactive plotting of model outputs vs inputs (1D and 2D)."""
+    try:
+        import matplotlib
+        matplotlib.use("TkAgg")
+    except Exception:
+        pass
+    try:
+        import matplotlib.pyplot as plt
+        from matplotlib import cm
+    except ImportError:
+        print("matplotlib is required for plotting. Install with: pip install matplotlib")
+        return
+
+    if not FEATURE_RANGES:
+        print("No feature range data available (model was saved without training data).")
+        return
+
+    n_feat = N_FEATURES
+    n_out = N_OUTPUTS
+    resolution = 200
+
+    # Build defaults
+    feat_defaults = {{}}
+    feat_mins = {{}}
+    feat_maxs = {{}}
+    for idx_str, (fmin, fmax, fmean) in FEATURE_RANGES.items():
+        idx = int(idx_str) if isinstance(idx_str, str) else idx_str
+        feat_defaults[idx] = fmean
+        feat_mins[idx] = fmin
+        feat_maxs[idx] = fmax
+
+    print("\\n--- MODEL PLOTTING ---")
+    print(f"Features ({{n_feat}}): {{', '.join(FEATURE_NAMES)}}")
+    print(f"Outputs  ({{n_out}}): {{', '.join(OUTPUT_NAMES)}}")
+
+    # Ask user for custom frozen values
+    print("\\nFrozen input defaults (mean of training data):")
+    for idx in range(n_feat):
+        print(f"  {{FEATURE_NAMES[idx]}}: {{feat_defaults.get(idx, 0.0):.4g}}"
+              f"  (range: {{feat_mins.get(idx, 0.0):.4g}} to {{feat_maxs.get(idx, 0.0):.4g}})")
+    custom = input("\\nCustomize frozen values? [y/N]: ").strip().lower()
+    if custom == 'y':
+        for idx in range(n_feat):
+            val = input(f"  {{FEATURE_NAMES[idx]}} [{{feat_defaults.get(idx, 0.0):.4g}}]: ").strip()
+            if val:
+                try:
+                    feat_defaults[idx] = float(val)
+                except ValueError:
+                    pass
+
+    # 1D plots: each feature vs each output
+    print("\\nGenerating 1D plots (each input vs each output)...")
+    for feat_idx in range(n_feat):
+        fmin = feat_mins.get(feat_idx, 0.0)
+        fmax = feat_maxs.get(feat_idx, 1.0)
+        if abs(fmax - fmin) < 1e-12:
+            continue
+        x_range = np.linspace(fmin, fmax, resolution)
+        X_grid = np.tile([feat_defaults.get(i, 0.0) for i in range(n_feat)], (resolution, 1))
+        X_grid[:, feat_idx] = x_range
+        y_pred = predict_raw(X_grid)
+
+        for out_idx in range(n_out):
+            fig, ax = plt.subplots(figsize=(8, 5))
+            ax.plot(x_range, y_pred[:, out_idx], linewidth=2)
+            frozen_str = ", ".join(
+                f"{{FEATURE_NAMES[i]}}={{feat_defaults.get(i, 0.0):.3g}}"
+                for i in range(n_feat) if i != feat_idx)
+            ax.set_xlabel(FEATURE_NAMES[feat_idx])
+            ax.set_ylabel(OUTPUT_NAMES[out_idx])
+            ax.set_title(f"{{OUTPUT_NAMES[out_idx]}} vs {{FEATURE_NAMES[feat_idx]}}")
+            if frozen_str:
+                ax.text(0.02, 0.98, f"Frozen: {{frozen_str}}", transform=ax.transAxes,
+                        fontsize=7, verticalalignment='top',
+                        bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+            ax.grid(True, alpha=0.3)
+            plt.tight_layout()
+
+    # 2D plots: each pair of features vs each output
+    if n_feat >= 2:
+        print("Generating 2D plots (each input pair vs each output)...")
+        res2d = 80
+        for i in range(n_feat):
+            for j in range(i + 1, n_feat):
+                fmin_i, fmax_i = feat_mins.get(i, 0.0), feat_maxs.get(i, 1.0)
+                fmin_j, fmax_j = feat_mins.get(j, 0.0), feat_maxs.get(j, 1.0)
+                if abs(fmax_i - fmin_i) < 1e-12 or abs(fmax_j - fmin_j) < 1e-12:
+                    continue
+                xi = np.linspace(fmin_i, fmax_i, res2d)
+                xj = np.linspace(fmin_j, fmax_j, res2d)
+                Xi, Xj = np.meshgrid(xi, xj)
+                X_grid = np.tile([feat_defaults.get(k, 0.0) for k in range(n_feat)],
+                                 (res2d * res2d, 1))
+                X_grid[:, i] = Xi.ravel()
+                X_grid[:, j] = Xj.ravel()
+                y_pred = predict_raw(X_grid)
+
+                for out_idx in range(n_out):
+                    Z = y_pred[:, out_idx].reshape(res2d, res2d)
+                    fig, ax = plt.subplots(figsize=(8, 6))
+                    cf = ax.contourf(Xi, Xj, Z, levels=30, cmap='viridis')
+                    plt.colorbar(cf, ax=ax, label=OUTPUT_NAMES[out_idx])
+                    ax.set_xlabel(FEATURE_NAMES[i])
+                    ax.set_ylabel(FEATURE_NAMES[j])
+                    frozen_str = ", ".join(
+                        f"{{FEATURE_NAMES[k]}}={{feat_defaults.get(k, 0.0):.3g}}"
+                        for k in range(n_feat) if k != i and k != j)
+                    title = f"{{OUTPUT_NAMES[out_idx]}} vs {{FEATURE_NAMES[i]}}, {{FEATURE_NAMES[j]}}"
+                    ax.set_title(title)
+                    if frozen_str:
+                        ax.text(0.02, 0.98, f"Frozen: {{frozen_str}}", transform=ax.transAxes,
+                                fontsize=7, verticalalignment='top',
+                                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+                    plt.tight_layout()
+
+    plt.show()
+
+
 def main():
     print("--- GRADIENT-BOOSTED MODEL INTERFACE ---")
     print("Required Inputs (unused features omitted):")
     for col in USED_COLS:
         print(f" - {{col}}")
+
+    # Ask if user wants to plot
+    try:
+        do_plot = input("\\nWould you like to plot the model? [y/N]: ").strip().lower()
+        if do_plot == 'y':
+            plot_model()
+    except (KeyboardInterrupt, EOFError):
+        pass
+
     print("\\nEnter values (Ctrl+C to exit):")
     try:
         while True:
@@ -10251,7 +10686,7 @@ def train_mode():
                 print(f"  Validation R²: {val_r2:.6f}")
 
         # Generate boosted prediction script
-        _generate_boosted_script(boosted_models, dp)
+        _generate_boosted_script(boosted_models, dp, X_data=X)
         return
 
     # ════════════════════════════════════════════════════════════════
@@ -10331,6 +10766,7 @@ def train_mode():
         print(f"Island Evolution started  [{ds_label} | {adf_label}]. Ctrl+C to stop.\n")
 
         gen = 0
+        perfect_outputs = set()   # outputs that reached perfect performance
         try:
             with concurrent.futures.ProcessPoolExecutor(max_workers=NUM_ISLANDS) as executor:
                 while True:
@@ -10375,6 +10811,9 @@ def train_mode():
 
                     futures = []
                     for i in range(n_outputs):
+                        if i in perfect_outputs:
+                            continue  # skip evolution on perfect outputs
+
                         # Determine if this output is part of a class group
                         g_info = out_group_info.get(i)
                         if g_info is not None:
@@ -10442,12 +10881,36 @@ def train_mode():
 
                     print(f"--- Generation {gen} ---")
 
+                    # ---- Perfect output detection & early stopping ----
+                    if gen % MIGRATION_FREQ == 0:
+                        for o_idx in range(n_outputs):
+                            if o_idx in perfect_outputs:
+                                continue
+                            is_perf, best_ind = _check_output_perfect(
+                                hofs[o_idx], X, Y[:, o_idx], out_types[o_idx])
+                            if is_perf:
+                                out_label = dp.output_map[o_idx] if o_idx < len(dp.output_map) else f"Out{o_idx}"
+                                print(f"\n  ★ Output {o_idx} ({out_label}) reached PERFECT performance!")
+                                print(f"    Running simplification pass on perfect output...")
+                                _simplify_perfect_output(
+                                    hofs[o_idx], X, Y[:, o_idx], out_types[o_idx],
+                                    target_grads=target_grads_list[o_idx])
+                                perfect_outputs.add(o_idx)
+                                # Save backup model
+                                best_models_snapshot = [h.get_best_overall() for h in hofs]
+                                _save_backup_model(best_models_snapshot, dp, o_idx, X_data=X)
+
+                        if len(perfect_outputs) == n_outputs:
+                            print("\n  ★★★ ALL outputs reached perfect performance! Stopping evolution.")
+                            break
+
                     # ---- Periodic frontier display ----
                     if gen % 500 == 0:
                         for o_idx, hof in enumerate(hofs):
                             out_label = dp.output_map[o_idx] if o_idx < len(dp.output_map) else f"Out{o_idx}"
+                            pf_tag = " [PERFECT]" if o_idx in perfect_outputs else ""
                             hof.print_frontier(out_type=out_types[o_idx],
-                                               label=f"Output {o_idx} ({out_label})")
+                                               label=f"Output {o_idx} ({out_label}){pf_tag}")
                         if X_val is not None and Y_val is not None:
                             _print_validation_metrics(hofs, X_val, Y_val, out_types, dp)
 
@@ -10483,6 +10946,13 @@ def train_mode():
                     if SIMPLIFICATION_FREQ > 0 and gen % SIMPLIFICATION_FREQ == 0:
                         print(f"\n[Gen {gen}] Running algebraic simplification pass…")
                         apply_simplification_pass(islands_pop, hofs, X, Y, out_types)
+
+                    # ---- Extra simplification for perfect outputs ----
+                    if perfect_outputs and gen % max(100, SIMPLIFICATION_FREQ if SIMPLIFICATION_FREQ > 0 else 100) == 0:
+                        for o_idx in perfect_outputs:
+                            _simplify_perfect_output(
+                                hofs[o_idx], X, Y[:, o_idx], out_types[o_idx],
+                                target_grads=target_grads_list[o_idx])
 
                     # ---- Deep constant optimisation ----
                     if gen > 0 and gen % 1000 == 0:
@@ -10549,6 +11019,7 @@ def train_mode():
         print(f"AFPO Evolution started  [{ds_label} | {adf_label}]. Ctrl+C to stop.\n")
 
         gen = 0
+        perfect_outputs = set()
         try:
             while True:
                 batch_idx = (np.random.choice(X.shape[0], BATCH_SIZE, replace=False)
@@ -10562,6 +11033,9 @@ def train_mode():
                     bg_logits_cache_a[col_name] = build_bg_logits(hofs, group_idxs, X_b)
 
                 for i in range(n_outputs):
+                    if i in perfect_outputs:
+                        continue  # skip training on perfect outputs
+
                     g_info_a = out_group_info_a.get(i)
                     if g_info_a is not None:
                         group_idxs_a, local_k_a = g_info_a
@@ -10611,12 +11085,34 @@ def train_mode():
                 gen += MIGRATION_FREQ
                 print(f"--- Generation {gen} ---")
 
+                # ---- Perfect output detection & early stopping ----
+                for o_idx in range(n_outputs):
+                    if o_idx in perfect_outputs:
+                        continue
+                    is_perf, best_ind = _check_output_perfect(
+                        hofs[o_idx], X, Y[:, o_idx], out_types[o_idx])
+                    if is_perf:
+                        out_label = dp.output_map[o_idx] if o_idx < len(dp.output_map) else f"Out{o_idx}"
+                        print(f"\n  ★ Output {o_idx} ({out_label}) reached PERFECT performance!")
+                        print(f"    Running simplification pass on perfect output...")
+                        _simplify_perfect_output(
+                            hofs[o_idx], X, Y[:, o_idx], out_types[o_idx],
+                            target_grads=target_grads_list[o_idx])
+                        perfect_outputs.add(o_idx)
+                        best_models_snapshot = [h.get_best_overall() for h in hofs]
+                        _save_backup_model(best_models_snapshot, dp, o_idx, X_data=X)
+
+                if len(perfect_outputs) == n_outputs:
+                    print("\n  ★★★ ALL outputs reached perfect performance! Stopping evolution.")
+                    break
+
                 # ---- Periodic frontier display ----
                 if gen % 500 == 0:
                     for o_idx, hof in enumerate(hofs):
                         out_label = dp.output_map[o_idx] if o_idx < len(dp.output_map) else f"Out{o_idx}"
+                        pf_tag = " [PERFECT]" if o_idx in perfect_outputs else ""
                         hof.print_frontier(out_type=out_types[o_idx],
-                                           label=f"Output {o_idx} ({out_label})")
+                                           label=f"Output {o_idx} ({out_label}){pf_tag}")
                     if X_val is not None and Y_val is not None:
                         _print_validation_metrics(hofs, X_val, Y_val, out_types, dp)
 
@@ -10664,6 +11160,13 @@ def train_mode():
                     # Unwrap back
                     for i in range(n_outputs):
                         afpo_pops[i] = pseudo_islands[i][0]
+
+                # ---- Extra simplification for perfect outputs ----
+                if perfect_outputs and gen % max(100, SIMPLIFICATION_FREQ if SIMPLIFICATION_FREQ > 0 else 100) == 0:
+                    for o_idx in perfect_outputs:
+                        _simplify_perfect_output(
+                            hofs[o_idx], X, Y[:, o_idx], out_types[o_idx],
+                            target_grads=target_grads_list[o_idx])
 
                 # ---- Deep constant optimisation ----
                 if gen > 0 and gen % 1000 == 0:
@@ -10743,6 +11246,7 @@ def train_mode():
         print(f"Islanded AFPOs started  [{ds_label} | {adf_label}]. Ctrl+C to stop.\n")
 
         gen = 0
+        perfect_outputs = set()
         try:
             with concurrent.futures.ProcessPoolExecutor(max_workers=NUM_ISLANDS) as executor:
                 while True:
@@ -10915,12 +11419,34 @@ def train_mode():
 
                     print(f"--- Generation {gen} ---")
 
+                    # ---- Perfect output detection & early stopping ----
+                    for o_idx in range(n_outputs):
+                        if o_idx in perfect_outputs:
+                            continue
+                        is_perf, best_ind = _check_output_perfect(
+                            hofs[o_idx], X, Y[:, o_idx], out_types[o_idx])
+                        if is_perf:
+                            out_label = dp.output_map[o_idx] if o_idx < len(dp.output_map) else f"Out{o_idx}"
+                            print(f"\n  ★ Output {o_idx} ({out_label}) reached PERFECT performance!")
+                            print(f"    Running simplification pass on perfect output...")
+                            _simplify_perfect_output(
+                                hofs[o_idx], X, Y[:, o_idx], out_types[o_idx],
+                                target_grads=target_grads_list[o_idx])
+                            perfect_outputs.add(o_idx)
+                            best_models_snapshot = [h.get_best_overall() for h in hofs]
+                            _save_backup_model(best_models_snapshot, dp, o_idx, X_data=X)
+
+                    if len(perfect_outputs) == n_outputs:
+                        print("\n  ★★★ ALL outputs reached perfect performance! Stopping evolution.")
+                        break
+
                     # ---- Periodic frontier display ----
                     if gen % 500 == 0:
                         for o_idx, hof in enumerate(hofs):
                             out_label = dp.output_map[o_idx] if o_idx < len(dp.output_map) else f"Out{o_idx}"
+                            pf_tag = " [PERFECT]" if o_idx in perfect_outputs else ""
                             hof.print_frontier(out_type=out_types[o_idx],
-                                               label=f"Output {o_idx} ({out_label})")
+                                               label=f"Output {o_idx} ({out_label}){pf_tag}")
                         if X_val is not None and Y_val is not None:
                             _print_validation_metrics(hofs, X_val, Y_val, out_types, dp)
 
@@ -10953,6 +11479,13 @@ def train_mode():
                     if SIMPLIFICATION_FREQ > 0 and gen % SIMPLIFICATION_FREQ == 0:
                         print(f"\n[Gen {gen}] Running algebraic simplification pass…")
                         apply_simplification_pass(islands_pop, hofs, X, Y, out_types)
+
+                    # ---- Extra simplification for perfect outputs ----
+                    if perfect_outputs and gen % max(100, SIMPLIFICATION_FREQ if SIMPLIFICATION_FREQ > 0 else 100) == 0:
+                        for o_idx in perfect_outputs:
+                            _simplify_perfect_output(
+                                hofs[o_idx], X, Y[:, o_idx], out_types[o_idx],
+                                target_grads=target_grads_list[o_idx])
 
                     # ---- Deep constant optimisation ----
                     if gen > 0 and gen % 1000 == 0:
@@ -11046,6 +11579,7 @@ def train_mode():
         print(f"  Graduation every {GRAD_FREQ} gens: best of Tier g → Tier g+1.\n")
 
         gen = 0
+        perfect_outputs = set()
         try:
             # Flatten all (tier, island) pairs for the executor
             all_pairs = [(tier, isl)
@@ -11200,12 +11734,34 @@ def train_mode():
 
                     print(f"--- Generation {gen} ---")
 
+                    # ---- Perfect output detection & early stopping ----
+                    for o_idx in range(n_outputs):
+                        if o_idx in perfect_outputs:
+                            continue
+                        is_perf, best_ind = _check_output_perfect(
+                            hofs[o_idx], X, Y[:, o_idx], out_types[o_idx])
+                        if is_perf:
+                            out_label = dp.output_map[o_idx] if o_idx < len(dp.output_map) else f"Out{o_idx}"
+                            print(f"\n  ★ Output {o_idx} ({out_label}) reached PERFECT performance!")
+                            print(f"    Running simplification pass on perfect output...")
+                            _simplify_perfect_output(
+                                hofs[o_idx], X, Y[:, o_idx], out_types[o_idx],
+                                target_grads=target_grads_list[o_idx])
+                            perfect_outputs.add(o_idx)
+                            best_models_snapshot = [h.get_best_overall() for h in hofs]
+                            _save_backup_model(best_models_snapshot, dp, o_idx, X_data=X)
+
+                    if len(perfect_outputs) == n_outputs:
+                        print("\n  ★★★ ALL outputs reached perfect performance! Stopping evolution.")
+                        break
+
                     # ---- Periodic frontier display ----
                     if gen % 500 == 0:
                         for o_idx, hof in enumerate(hofs):
                             out_label = dp.output_map[o_idx] if o_idx < len(dp.output_map) else f"Out{o_idx}"
+                            pf_tag = " [PERFECT]" if o_idx in perfect_outputs else ""
                             hof.print_frontier(out_type=out_types[o_idx],
-                                               label=f"Output {o_idx} ({out_label})")
+                                               label=f"Output {o_idx} ({out_label}){pf_tag}")
                         if X_val is not None and Y_val is not None:
                             _print_validation_metrics(hofs, X_val, Y_val, out_types, dp)
 
@@ -11258,6 +11814,13 @@ def train_mode():
                             for isl in range(N_ISL_PER_G):
                                 for j in range(n_outputs):
                                     tier_islands[tier][isl][j] = flat_isl[isl][j]
+
+                    # ---- Extra simplification for perfect outputs ----
+                    if perfect_outputs and gen % max(100, SIMPLIFICATION_FREQ if SIMPLIFICATION_FREQ > 0 else 100) == 0:
+                        for o_idx in perfect_outputs:
+                            _simplify_perfect_output(
+                                hofs[o_idx], X, Y[:, o_idx], out_types[o_idx],
+                                target_grads=target_grads_list[o_idx])
 
                     # ---- Deep constant optimisation ----
                     if gen > 0 and gen % 1000 == 0:
@@ -11330,7 +11893,7 @@ def train_mode():
             print(f"Output {i} ({out_label}): No valid models found.\n")
 
 
-    generate_script(best_models, dp)
+    generate_script(best_models, dp, X_data=X)
 
 
 if __name__ == "__main__":
