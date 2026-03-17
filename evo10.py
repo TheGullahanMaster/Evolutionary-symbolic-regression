@@ -3558,6 +3558,188 @@ def generate_importance_biased_seeds(n_features, feature_names, X, y):
     return seeds
 
 
+def generate_residual_aware_seeds(n_features, feature_names, X, y_target,
+                                   hof_best, max_seeds=10):
+    """
+    Generate seeds targeted at regions where the current HoF best is failing.
+
+    Strategy:
+      1. Evaluate the HoF best to get residuals.
+      2. Find the samples with the largest absolute residuals (error hotspots).
+      3. Analyze which features are most correlated with those residual patterns.
+      4. Generate seeds that specifically target those features and patterns.
+      5. Also generate seeds for the residuals themselves (treating residuals
+         as a new regression target), biased toward features correlated with
+         the error pattern.
+
+    This breaks the "seed basin trap" where the population converges to seed
+    templates and can't discover the correction terms needed for regions those
+    seeds don't cover.
+    """
+    seeds = []
+    allowed = set(CGPEquation.OPS_ALL)
+    if hof_best is None or n_features < 1:
+        return seeds
+
+    try:
+        # Compute residuals from the HoF best
+        preds = hof_best.tree.evaluate(X)
+        preds = np.clip(np.nan_to_num(preds, nan=0.0, posinf=1e9, neginf=-1e9),
+                        -1e9, 1e9)
+        preds = hof_best.affine_a * preds + hof_best.affine_b
+        # Apply boost corrections if any
+        for corr_tree, ca, cb, lr in getattr(hof_best, 'boost_stages', []):
+            corr = corr_tree.evaluate(X)
+            corr = np.clip(np.nan_to_num(corr, nan=0.0, posinf=1e9,
+                           neginf=-1e9), -1e9, 1e9)
+            preds += lr * (ca * corr + cb)
+
+        residuals = y_target - preds
+        res_std = float(np.std(residuals))
+        if res_std < 1e-10:
+            return seeds  # HoF is near-perfect
+
+        # ── Step 1: Feature-residual correlation analysis ──────────────────
+        # Find which features explain the remaining error pattern
+        res_importance = {}
+        for i in range(n_features):
+            xi = X[:, i]
+            if np.std(xi) < 1e-10:
+                continue
+            r = abs(float(np.corrcoef(xi, residuals)[0, 1]))
+            res_importance[i] = 0.0 if np.isnan(r) else r
+
+        # Also check nonlinear transforms of features against residuals
+        res_transform_imp = {}
+        for i in range(min(n_features, 10)):
+            xi = X[:, i]
+            if np.std(xi) < 1e-10:
+                continue
+            for name, fn in [('sq', lambda v: v**2),
+                             ('sqrt', lambda v: np.sqrt(np.abs(v))),
+                             ('sin', lambda v: np.sin(v)),
+                             ('cos', lambda v: np.cos(v)),
+                             ('log', lambda v: np.log(np.abs(v) + 1e-30)),
+                             ('inv', lambda v: 1.0 / (np.abs(v) + 1e-8))]:
+                try:
+                    xform = fn(xi)
+                    xform = np.nan_to_num(xform, nan=0.0, posinf=0.0, neginf=0.0)
+                    if np.std(xform) < 1e-10:
+                        continue
+                    r = abs(float(np.corrcoef(xform, residuals)[0, 1]))
+                    if not np.isnan(r) and r > res_importance.get(i, 0.0):
+                        res_transform_imp[(i, name)] = r
+                except Exception:
+                    pass
+
+        # ── Step 2: Generate seeds for top residual-correlated features ────
+        ranked = sorted(res_importance.items(), key=lambda x: -x[1])
+
+        for feat_idx, imp in ranked[:4]:
+            if imp < 0.05:
+                continue
+
+            # Simple linear seed on this feature (targets residual directly)
+            if 'const' in allowed and '*' in allowed:
+                cgp = _make_cgp_base(n_features, feature_names)
+                nf = n_features
+                # Estimate slope from residuals
+                xi = X[:, feat_idx]
+                xi_std = float(np.std(xi))
+                if xi_std > 1e-10:
+                    slope = float(np.cov(xi, residuals)[0, 1] / (xi_std**2))
+                else:
+                    slope = 1.0
+                cgp.nodes[0] = CGPNode('const', 0, 0, slope)
+                cgp.nodes[1] = CGPNode('*', nf, feat_idx)
+                cgp.out_idx = nf + 1
+                cgp.update_active_nodes()
+                seeds.append(Individual(cgp))
+
+            # Check best nonlinear transform
+            best_xform = None
+            best_r = imp
+            for (fi, xname), ximp in res_transform_imp.items():
+                if fi == feat_idx and ximp > best_r:
+                    best_xform = xname
+                    best_r = ximp
+
+            op_map = {'sq': 'square', 'sqrt': 'sqrt', 'sin': 'sin',
+                      'cos': 'cos', 'log': 'log', 'inv': 'inv'}
+            if best_xform and op_map.get(best_xform) in allowed:
+                cgp = _make_cgp_base(n_features, feature_names)
+                cgp.nodes[0] = CGPNode(op_map[best_xform], feat_idx, 0)
+                cgp.out_idx = n_features
+                cgp.update_active_nodes()
+                seeds.append(Individual(cgp))
+
+        # ── Step 3: Pairwise interaction seeds for residuals ───────────────
+        # Check if products/ratios of features explain the residual
+        top2 = [f for f, _ in ranked[:5] if res_importance.get(f, 0) > 0.05]
+        for i in range(len(top2)):
+            for j in range(i + 1, len(top2)):
+                fi, fj = top2[i], top2[j]
+                if '*' in allowed:
+                    xi_xj = X[:, fi] * X[:, fj]
+                    xi_xj = np.nan_to_num(xi_xj, nan=0.0, posinf=0.0, neginf=0.0)
+                    if np.std(xi_xj) > 1e-10:
+                        r = abs(float(np.corrcoef(xi_xj, residuals)[0, 1]))
+                        if not np.isnan(r) and r > 0.15:
+                            cgp = _make_cgp_base(n_features, feature_names)
+                            cgp.nodes[0] = CGPNode('*', fi, fj)
+                            cgp.out_idx = n_features
+                            cgp.update_active_nodes()
+                            seeds.append(Individual(cgp))
+
+        # ── Step 4: Error-hotspot focused seeds ────────────────────────────
+        # Find the top-20% highest-error samples and generate seeds biased
+        # toward the feature subspace of those samples
+        abs_res = np.abs(residuals)
+        threshold = np.percentile(abs_res, 80)
+        hotspot_mask = abs_res >= threshold
+        n_hotspot = int(np.sum(hotspot_mask))
+
+        if n_hotspot >= 5 and n_hotspot < len(residuals):
+            X_hot = X[hotspot_mask]
+            res_hot = residuals[hotspot_mask]
+
+            # Re-run importance on the hotspot subset
+            for feat_idx in range(min(n_features, 8)):
+                xi = X_hot[:, feat_idx]
+                if np.std(xi) < 1e-10 or np.std(res_hot) < 1e-10:
+                    continue
+                r = abs(float(np.corrcoef(xi, res_hot)[0, 1]))
+                if np.isnan(r) or r < 0.2:
+                    continue
+
+                # Seed with a const*feature targeting the hotspot pattern
+                if 'const' in allowed and '*' in allowed:
+                    xi_std = float(np.std(xi))
+                    if xi_std > 1e-10:
+                        slope = float(np.cov(xi, res_hot)[0, 1] / (xi_std**2))
+                    else:
+                        slope = 1.0
+                    cgp = _make_cgp_base(n_features, feature_names)
+                    nf = n_features
+                    cgp.nodes[0] = CGPNode('const', 0, 0, slope)
+                    cgp.nodes[1] = CGPNode('*', nf, feat_idx)
+                    cgp.out_idx = nf + 1
+                    cgp.update_active_nodes()
+                    seeds.append(Individual(cgp))
+
+        # ── Step 5: Mutated variants of HoF best targeting residuals ───────
+        # Create mutations of the HoF best that might capture missing patterns
+        for rate_mult in [2, 4, 8]:
+            tree = mutate(hof_best.tree, n_features, feature_names,
+                          mut_rate=max(1, CGP_MUT_RATE * rate_mult))
+            seeds.append(Individual(tree))
+
+    except Exception:
+        pass  # never let seed generation crash the main loop
+
+    return seeds[:max_seeds]
+
+
 def generate_seeds_v5(n_features, feature_names):
     """Generate a diverse population of hand-crafted seed individuals."""
     seeds = []
@@ -4552,6 +4734,127 @@ def crossover(parent1_eq, parent2_eq):
     return child_eq
 
 
+def _semantic_crossover(parent1_eq, parent2_eq, X, y_residuals, n_probe=64):
+    """
+    Semantic-ish crossover: combine two parents by evaluating which parent's
+    sub-expressions better fit different regions of the residual landscape.
+
+    Strategy:
+      1. Evaluate both parents on a probe set to get output vectors.
+      2. For each sample, compute which parent has smaller absolute residual.
+      3. Build a child that inherits active nodes from the parent that performs
+         better on the majority of samples, but splices in the *other* parent's
+         active sub-graph when it covers a different behavioral niche.
+      4. If the parents produce outputs that are complementary (low correlation
+         of their residuals), create a child that adds their outputs via a new
+         node: child = a*parent1 + b*parent2 (residual boosting crossover).
+
+    This is "semantic-ish" because it uses output behavior to guide structural
+    recombination, not just random node swapping.
+    """
+    if len(parent1_eq.nodes) != len(parent2_eq.nodes):
+        return copy.deepcopy(parent1_eq)
+
+    n = X.shape[0]
+    probe_n = min(n_probe, n)
+    idx = np.random.choice(n, probe_n, replace=False)
+    Xp = X[idx]
+    rp = y_residuals[idx] if y_residuals is not None else None
+
+    try:
+        out1 = parent1_eq.evaluate(Xp)
+        out1 = np.nan_to_num(out1, nan=0.0, posinf=0.0, neginf=0.0)
+        out2 = parent2_eq.evaluate(Xp)
+        out2 = np.nan_to_num(out2, nan=0.0, posinf=0.0, neginf=0.0)
+    except Exception:
+        return crossover(parent1_eq, parent2_eq)
+
+    # Check if outputs are complementary (residuals from each are anti-correlated
+    # or uncorrelated — meaning they explain different parts of the variance).
+    if rp is not None:
+        res1 = rp - out1
+        res2 = rp - out2
+        std1, std2 = np.std(res1), np.std(res2)
+        if std1 > 1e-8 and std2 > 1e-8:
+            corr_residuals = float(np.corrcoef(res1, res2)[0, 1])
+            if np.isnan(corr_residuals):
+                corr_residuals = 1.0
+        else:
+            corr_residuals = 1.0
+
+        # If residuals are weakly correlated (< 0.5), parents explain different
+        # parts of the data — combine them additively (gradient boosting crossover).
+        # Build: out = parent1_output + parent2_output via a '+' node.
+        if corr_residuals < 0.5 and '+' in ALLOWED_OPS:
+            child_eq = copy.deepcopy(parent1_eq)
+            nf = child_eq.n_features
+
+            # Find a free slot after both parents' active regions
+            max_active = max(
+                (i for i in child_eq.active_nodes if i >= nf),
+                default=nf)
+            # We need: one slot for parent2's output copy, one for the add node
+            all_slots = range(nf, nf + child_eq.max_nodes)
+            free_slots = sorted(s for s in all_slots
+                                if s not in child_eq.active_nodes
+                                and s > max_active)
+
+            if len(free_slots) >= 1:
+                # Copy parent2's active structure into child's inactive region
+                # Strategy: copy parent2 nodes into child, remap output
+                p2 = copy.deepcopy(parent2_eq)
+
+                # Simple approach: place a '+' node that references both outputs
+                add_slot = free_slots[0]
+                add_idx = add_slot - nf
+                child_eq.nodes[add_idx] = CGPNode(
+                    '+', child_eq.out_idx, p2.out_idx)
+
+                # Copy parent2's active nodes into child
+                for i in sorted(p2.active_nodes):
+                    if i >= nf:
+                        ni = i - nf
+                        if ni < len(child_eq.nodes):
+                            # Only copy if the slot isn't active in child
+                            slot = nf + ni
+                            if slot not in child_eq.active_nodes:
+                                child_eq.nodes[ni] = copy.deepcopy(p2.nodes[ni])
+
+                child_eq.out_idx = add_slot
+                child_eq.update_active_nodes()
+                return child_eq
+
+    # Fallback: behavior-biased node swap.
+    # Determine which parent's output is closer to the residual target on
+    # more probe points, and bias the swap probability accordingly.
+    if rp is not None:
+        err1 = np.mean(np.abs(rp - out1))
+        err2 = np.mean(np.abs(rp - out2))
+        # p2_bias: probability of taking from parent2 (higher if p2 is better)
+        total_err = err1 + err2 + 1e-30
+        p2_bias = float(err1 / total_err)  # higher p1 error → more p2 nodes
+        p2_bias = np.clip(p2_bias, 0.2, 0.8)  # keep it reasonable
+    else:
+        p2_bias = 0.5
+
+    child_eq = copy.deepcopy(parent1_eq)
+    p2_active = parent2_eq.active_nodes
+    p1_active = parent1_eq.active_nodes
+
+    for i in range(len(child_eq.nodes)):
+        slot = parent1_eq.n_features + i
+        is_active = (slot in p1_active) or (slot in p2_active)
+        swap_prob = p2_bias if is_active else 0.05
+        if random.random() < swap_prob:
+            child_eq.nodes[i] = copy.deepcopy(parent2_eq.nodes[i])
+
+    if random.random() < p2_bias:
+        child_eq.out_idx = parent2_eq.out_idx
+
+    child_eq.update_active_nodes()
+    return child_eq
+
+
 # ==========================================
 # PART 4d: MACRO-MUTATIONS & EVOLUTION HELPERS
 # ==========================================
@@ -5093,6 +5396,122 @@ class Individual:
         # Locked after the first full-data evaluation; prevents minibatch noise
         # and constant-optimisation from silently re-fitting the affine rescaling.
         self.affine_fitted = False
+        # ── Intra-individual gradient boosting stages ──────────────────
+        # Each individual can accumulate small correction terms that fit the
+        # residuals left after the main tree's prediction.  This is "gradient
+        # boosting within a single equation" — the main tree provides the base
+        # prediction, and boost_stages stores (correction_tree, affine_a, affine_b, lr)
+        # tuples that additively correct the output.
+        self.boost_stages = []     # list of (CGPEquation, a, b, lr)
+        self.boost_max_stages = 3  # cap to prevent over-fitting
+
+    def _predict_with_boosts(self, X):
+        """Evaluate main tree + all boost correction stages."""
+        preds = self.tree.evaluate(X)
+        preds = np.clip(np.nan_to_num(preds, nan=0.0, posinf=1e9, neginf=-1e9),
+                        -1e9, 1e9)
+        preds = self.affine_a * preds + self.affine_b
+        for corr_tree, ca, cb, lr in self.boost_stages:
+            corr = corr_tree.evaluate(X)
+            corr = np.clip(np.nan_to_num(corr, nan=0.0, posinf=1e9, neginf=-1e9),
+                           -1e9, 1e9)
+            preds += lr * (ca * corr + cb)
+        return preds
+
+    def boost_on_residuals(self, X, y_target, type_code, n_features, feat_names,
+                           max_boost_gens=50, boost_lr=0.3):
+        """
+        Intra-individual gradient boosting: evolve a small correction tree on the
+        residuals left by the current prediction (main tree + existing boosts).
+
+        This helps individuals that have a good structural form but miss specific
+        data patterns — the correction term patches those gaps without changing
+        the main tree's structure.
+
+        Only applies to regression (type_code != 6) and only if the individual
+        has not reached its boost stage cap.
+        """
+        if type_code == 6:
+            return  # skip for classification
+        if len(self.boost_stages) >= self.boost_max_stages:
+            return
+        if not self.affine_fitted:
+            return  # need fitted affine first
+
+        # Compute current residuals
+        preds = self._predict_with_boosts(X)
+        residuals = y_target - preds
+        res_var = float(np.var(residuals))
+        if res_var < 1e-10:
+            return  # already near-perfect
+
+        # Mini-evolution: small population, short run, targeting residuals
+        MINI_POP = 15
+        MINI_NODES = max(10, CGP_NODES // 3)  # smaller graphs for corrections
+
+        mini_pop = []
+        for _ in range(MINI_POP):
+            cgp = random_cgp(n_features, MINI_NODES, feat_names)
+            ind = Individual(cgp)
+            ind.boost_stages = []  # corrections don't have sub-corrections
+            ind.boost_max_stages = 0
+            mini_pop.append(ind)
+
+        # Evaluate on residuals
+        for ind in mini_pop:
+            ind.calculate_fitness(X, residuals, 5)  # regression on residuals
+
+        best = min(mini_pop, key=lambda x: x.loss)
+
+        # Simple evolutionary loop
+        for _ in range(max_boost_gens):
+            parent = min(random.sample(mini_pop, min(3, len(mini_pop))),
+                         key=lambda x: x.fitness)
+            child_tree = mutate(parent.tree, n_features, feat_names,
+                                mut_rate=max(1, CGP_MUT_RATE))
+            child = Individual(child_tree)
+            child.boost_stages = []
+            child.boost_max_stages = 0
+            child.calculate_fitness(X, residuals, 5)
+
+            if child.loss < best.loss:
+                best = child
+
+            # Replace worst
+            worst = max(mini_pop, key=lambda x: x.fitness)
+            if child.fitness < worst.fitness:
+                mini_pop.remove(worst)
+                mini_pop.append(child)
+
+        # Check if the correction actually helps
+        if best.loss >= 1e9 or best.r2 < 0.01:
+            return  # correction is useless
+
+        # Quick const-opt on the correction
+        if get_constants_shared(best.tree):
+            best.optimize_constants(X, residuals, 5,
+                                    max_rows=min(500, X.shape[0]),
+                                    n_restarts=1, max_iter=30)
+
+        # Verify the correction reduces total error
+        corr_preds = best.tree.evaluate(X)
+        corr_preds = np.clip(np.nan_to_num(corr_preds, nan=0.0, posinf=1e9,
+                                            neginf=-1e9), -1e9, 1e9)
+        corr_scaled = boost_lr * (best.affine_a * corr_preds + best.affine_b)
+        new_preds = preds + corr_scaled
+        new_mse = float(np.mean((y_target - new_preds) ** 2))
+        old_mse = float(np.mean(residuals ** 2))
+
+        if new_mse < old_mse * 0.95:  # at least 5% improvement
+            self.boost_stages.append((
+                copy.deepcopy(best.tree),
+                best.affine_a,
+                best.affine_b,
+                boost_lr
+            ))
+            # Update complexity to account for the correction
+            self.complexity += best.tree.get_complexity() * 0.5  # discounted
+
     def calculate_fitness(self, X, y_target, type_code, batch_indices=None,
                           bg_logits=None, class_idx_in_group=None, Y_group=None,
                           freq_parsimony_adj=0.0, update_affine=True,
@@ -5252,6 +5671,15 @@ class Individual:
 
                 # Apply the locked affine to the (possibly batched) predictions
                 preds  = self.affine_a * preds + self.affine_b
+
+                # ── Apply intra-individual boost corrections ───────────────
+                if self.boost_stages:
+                    for corr_tree, ca, cb, lr in self.boost_stages:
+                        corr = corr_tree.evaluate(X_eval)
+                        corr = np.clip(np.nan_to_num(corr, nan=0.0,
+                                       posinf=1e9, neginf=-1e9), -1e9, 1e9)
+                        preds += lr * (ca * corr + cb)
+
                 y_mean = float(np.mean(y_eval))
                 diff   = preds - y_eval
 
@@ -5518,13 +5946,28 @@ class Individual:
                     - preds * y_target[indices]
                     + np.log(1 + np.exp(-np.abs(preds))))
         else:
-            # --- NEW: Apply locked affine scaling ---
+            # --- Apply locked affine scaling + boost corrections ---
             a = getattr(self, 'affine_a', 1.0)
             b = getattr(self, 'affine_b', 0.0)
             preds = a * preds + b
+            for corr_tree, ca, cb, lr in getattr(self, 'boost_stages', []):
+                corr = corr_tree.evaluate(X[indices])
+                corr = np.clip(np.nan_to_num(corr, nan=0.0, posinf=1e9,
+                               neginf=-1e9), -1e9, 1e9)
+                preds += lr * (ca * corr + cb)
             # ----------------------------------------
             diff = preds - y_target[indices]
             return np.where(np.abs(diff) > 100, np.abs(diff) - 0.6931, np.log(np.cosh(diff)))
+
+    def full_expr_string(self):
+        """String representation including boost correction stages."""
+        base = f"{self.affine_a:.4g} * ({str(self.tree)}) + {self.affine_b:.4g}"
+        if not getattr(self, 'boost_stages', []):
+            return base
+        parts = [base]
+        for i, (corr_tree, ca, cb, lr) in enumerate(self.boost_stages):
+            parts.append(f" + {lr:.3g} * ({ca:.4g} * ({str(corr_tree)}) + {cb:.4g})")
+        return "".join(parts)
 
 
 # ==========================================
@@ -6468,11 +6911,15 @@ def macro_trig_identity(cgp_eq, n_features):
 
 def _create_offspring(action, parent, population, n_features, feat_names,
                       eff_rate, sa_temp, parent_sigma, X,
-                      op_affinity=None):
+                      op_affinity=None, y_residuals=None):
     """Shared offspring creation logic for both island evolution and AFPO.
 
     Returns (child_tree, child_sigma) after applying the chosen reproductive
     action to *parent*.
+
+    y_residuals : optional (N,) array — current target residuals, used by
+                  semantic crossover to guide recombination toward residual-
+                  reducing combinations.
     """
     child_sigma = float(np.clip(
         parent_sigma * np.exp(random.gauss(0, SIGMA_TAU)),
@@ -6491,6 +6938,18 @@ def _create_offspring(action, parent, population, n_features, feat_names,
         child_sigma = float(np.clip(
             (parent_sigma + p2_sigma) / 2.0 * np.exp(random.gauss(0, SIGMA_TAU * 0.5)),
             SIGMA_MIN, SIGMA_MAX))
+    elif action == 'semantic_xover' and len(population) >= 2:
+        # Semantic-ish crossover: combine parents based on residual behavior
+        parent2 = tournament_select(population, k=3)
+        child_tree = _semantic_crossover(parent.tree, parent2.tree, X,
+                                          y_residuals)
+        # Light mutation to explore around the semantic combination
+        child_tree = mutate(child_tree, n_features, feat_names,
+                            mut_rate=max(1, eff_rate // 2), temperature=sa_temp)
+        p2_sigma = getattr(parent2, 'sigma', float(CGP_MUT_RATE))
+        child_sigma = float(np.clip(
+            (parent_sigma + p2_sigma) / 2.0 * np.exp(random.gauss(0, SIGMA_TAU * 0.5)),
+            SIGMA_MIN, SIGMA_MAX))
     elif action == 'grow':
         child_tree = macro_grow(parent.tree, n_features, feat_names,
                                 op_affinity=op_affinity)
@@ -6498,7 +6957,7 @@ def _create_offspring(action, parent, population, n_features, feat_names,
         child_tree = macro_prune(parent.tree, n_features)
     elif action == 'graft':
         child_tree = macro_graft_feature(parent.tree, n_features, feat_names)
-    elif action in ('optimize', 'do_nothing'):
+    elif action in ('optimize', 'do_nothing', 'boost'):
         child_tree = copy.deepcopy(parent.tree)
     elif action == 'div':
         child_tree = macro_rational_grow(parent.tree, n_features)
@@ -6571,8 +7030,8 @@ def evolve_island_chunk(args):
 
     # ── IMPROVEMENT: Adaptive reproductive operator tracker ────────────────
     # Tracks which operators produce accepted children; adapts weights over time.
-    _repro_ops_base = ['mutate', 'crossover', 'grow', 'prune', 'graft', 'optimize', 'do_nothing', 'div', 'trig', 'ablate']
-    _repro_weights_base = [4.0, 1.0, 0.5, 0.5, 0.5, 1.5, 0.5, 0.5, 0.8, 0.3]
+    _repro_ops_base = ['mutate', 'crossover', 'semantic_xover', 'grow', 'prune', 'graft', 'optimize', 'boost', 'do_nothing', 'div', 'trig', 'ablate']
+    _repro_weights_base = [4.0, 1.0, 0.8, 0.5, 0.5, 0.5, 1.5, 0.6, 0.5, 0.5, 0.8, 0.3]
     _mut_tracker = AdaptiveMutationTracker(_repro_ops_base, _repro_weights_base, alpha=0.07)
 
     # ── IMPROVEMENT: Operator affinity (updated every 200 gens) ───────────
@@ -6638,11 +7097,31 @@ def evolve_island_chunk(args):
                             'affine_b':   _ind.affine_b,
                         })
 
+        # ── IMPROVEMENT: Periodic intra-individual boosting ──────────────────
+        # Every 150 gens, try boosting the top-3 individuals' residuals.
+        # This is the core "gradient boosting within each equation" mechanism.
+        _BOOST_FREQ = 150
+        if (gen > 0 and gen % _BOOST_FREQ == 0
+                and type_code != 6 and bg_logits is None):
+            top_boost = sorted(island_pop, key=lambda x: x.loss)[:3]
+            for _ind in top_boost:
+                if _ind.affine_fitted and len(getattr(_ind, 'boost_stages', [])) < getattr(_ind, 'boost_max_stages', 3):
+                    _old_loss = _ind.loss
+                    _ind.boost_on_residuals(X, y_target, type_code,
+                                            n_features, feat_names,
+                                            max_boost_gens=30, boost_lr=0.3)
+                    if len(_ind.boost_stages) > 0 and _ind.boost_stages != getattr(_ind, '_prev_boost_stages', None):
+                        # Re-evaluate with the new boost correction
+                        _ind.calculate_fitness(X, y_target, type_code,
+                                               update_affine=False,
+                                               target_grads=target_grads)
+                        if _ind.loss < _old_loss - 1e-8:
+                            local_hof.update(_ind)
+
         # ── IMPROVEMENT: Periodic operator affinity update ────────────────────
         if gen % _AFFINITY_UPDATE_FREQ == 0 and local_hof.best_by_complexity:
             _op_affinity = compute_hof_operator_affinity([local_hof])
 
-        # 1. Parent selection via epsilon-lexicase
         # 1. Parent selection
         parent = epsilon_lexicase_selection(island_pop, X, y_target, type_code,
                                             bg_logits=bg_logits,
@@ -6665,19 +7144,23 @@ def evolve_island_chunk(args):
         child_tree, child_sigma = _create_offspring(
             action, parent, island_pop, n_features, feat_names,
             eff_rate, sa_temp, parent_sigma, X,
-            op_affinity=_op_affinity if _op_affinity else None)
+            op_affinity=_op_affinity if _op_affinity else None,
+            y_residuals=y_target)
 
         child       = Individual(child_tree)
         child.sigma = child_sigma
         child.age   = int(parent.age * 0.5)
+        # Inherit boost stages from parent if action preserves structure
+        if action in ('optimize', 'boost', 'do_nothing') and hasattr(parent, 'boost_stages'):
+            child.boost_stages = copy.deepcopy(parent.boost_stages)
 
         # ------------------------------------------------------------------ #
         # 3. Fitness Calculation & Fast Optimization Action
         # ------------------------------------------------------------------ #
         child_freq_adj = freq_adj.get(int(round(child.tree.get_complexity())), 0.0)
-        
+
         if action == 'optimize':
-            # PySR runs a fast optimization cycle here: no DE, just a quick 
+            # PySR runs a fast optimization cycle here: no DE, just a quick
             # 15-iteration L-BFGS-B nudge into the local gradient basin.
             child.optimize_constants(X, y_target, type_code,
                                      max_rows=None, n_restarts=1, max_iter=15,
@@ -6686,6 +7169,22 @@ def evolve_island_chunk(args):
                                      Y_group=Y_group,
                                      freq_parsimony_adj=child_freq_adj,
                                      target_grads=target_grads)
+        elif action == 'boost':
+            # Intra-individual gradient boosting: evolve a correction on residuals
+            child.calculate_fitness(X, y_target, type_code,
+                                    bg_logits=bg_logits,
+                                    class_idx_in_group=class_idx_in_group,
+                                    Y_group=Y_group,
+                                    freq_parsimony_adj=child_freq_adj,
+                                    target_grads=target_grads)
+            if type_code != 6 and bg_logits is None:
+                child.boost_on_residuals(X, y_target, type_code,
+                                         n_features, feat_names)
+                # Re-evaluate with boost correction applied
+                child.calculate_fitness(X, y_target, type_code,
+                                        freq_parsimony_adj=child_freq_adj,
+                                        update_affine=False,
+                                        target_grads=target_grads)
         else:
             child.calculate_fitness(X, y_target, type_code,
                                     bg_logits=bg_logits,
@@ -6757,12 +7256,20 @@ def evolve_island_chunk(args):
             # most cache entries will be stale misses anyway.
             _FITNESS_CACHE.clear()
 
-            # Directed injection: a spectrum of perturbations around the local
-            # best — light, medium, and heavy mutations — so extinction produces
-            # a diversity cloud centred on the best-known solution rather than
-            # a single heavily-mutated copy that may be too far away to recover.
+            # ── Residual-aware seed injection ──────────────────────────────
+            # Generate seeds that specifically target the HoF best's error
+            # patterns — breaks the "seed basin trap" where the population
+            # converges to seed templates and can't discover correction terms.
             hof_best  = local_hof.get_best_overall()
             if hof_best is not None:
+                try:
+                    res_seeds = generate_residual_aware_seeds(
+                        n_features, feat_names, X, y_target, hof_best,
+                        max_seeds=max(5, int(len(island_pop) * 0.15)))
+                    new_blood.extend(res_seeds)
+                except Exception:
+                    pass
+
                 n_directed = max(3, int(len(island_pop) * 0.20))
                 for k in range(n_directed):
                     # Cycle through light / medium / heavy perturbation
@@ -7050,9 +7557,9 @@ def evolve_afpo(population, X, y_target, type_code,
     MACRO_P_GRAFT = 0.06    # feature-graft macro-mutation
 
     # ── Adaptive reproductive operator tracker (same as island model) ─────
-    _repro_ops_base = ['mutate', 'crossover', 'grow', 'prune', 'graft',
-                       'optimize', 'do_nothing', 'div', 'trig', 'ablate']
-    _repro_weights_base = [4.0, 1.0, 0.5, 0.5, 0.5, 1.5, 0.5, 0.5, 0.8, 0.3]
+    _repro_ops_base = ['mutate', 'crossover', 'semantic_xover', 'grow', 'prune', 'graft',
+                       'optimize', 'boost', 'do_nothing', 'div', 'trig', 'ablate']
+    _repro_weights_base = [4.0, 1.0, 0.8, 0.5, 0.5, 0.5, 1.5, 0.6, 0.5, 0.5, 0.8, 0.3]
     _mut_tracker = AdaptiveMutationTracker(_repro_ops_base, _repro_weights_base, alpha=0.07)
 
     local_stag = stag_counter
@@ -7113,27 +7620,47 @@ def evolve_afpo(population, X, y_target, type_code,
 
         child_tree, child_sigma = _create_offspring(
             action, parent, population, n_features, feat_names,
-            eff_rate, sa_temp, parent_sigma, X)
+            eff_rate, sa_temp, parent_sigma, X,
+            y_residuals=y_target)
 
         child       = Individual(child_tree)
         child.sigma = child_sigma
         child.age   = 0    # AFPO invariant
+        # Inherit boost stages from parent if action preserves structure
+        if action in ('optimize', 'boost', 'do_nothing') and hasattr(parent, 'boost_stages'):
+            child.boost_stages = copy.deepcopy(parent.boost_stages)
 
         # ------------------------------------------------------------------ #
         # Fitness Calculation & Fast Optimization Action
         # ------------------------------------------------------------------ #
         child_freq_adj = freq_adj.get(int(round(child.tree.get_complexity())), 0.0)
-        
+
         if action == 'optimize':
-            child.optimize_constants(X, y_target, type_code,  # <-- Fixed: X, y_target
+            child.optimize_constants(X, y_target, type_code,
                                      max_rows=None, n_restarts=1, max_iter=15,
                                      bg_logits=bg_logits,
                                      class_idx_in_group=class_idx_in_group,
                                      Y_group=Y_group,
                                      freq_parsimony_adj=child_freq_adj,
                                      target_grads=target_grads)
+        elif action == 'boost':
+            # Intra-individual gradient boosting: evolve a correction on residuals
+            child.calculate_fitness(X, y_target, type_code,
+                                    bg_logits=bg_logits,
+                                    class_idx_in_group=class_idx_in_group,
+                                    Y_group=Y_group,
+                                    freq_parsimony_adj=child_freq_adj,
+                                    target_grads=target_grads)
+            if type_code != 6 and bg_logits is None:
+                child.boost_on_residuals(X, y_target, type_code,
+                                         n_features, feat_names)
+                # Re-evaluate with boost correction applied
+                child.calculate_fitness(X, y_target, type_code,
+                                        freq_parsimony_adj=child_freq_adj,
+                                        update_affine=False,
+                                        target_grads=target_grads)
         else:
-            child.calculate_fitness(X, y_target, type_code,   # <-- Fixed: X, y_target
+            child.calculate_fitness(X, y_target, type_code,
                                     bg_logits=bg_logits,
                                     class_idx_in_group=class_idx_in_group,
                                     Y_group=Y_group,
@@ -7207,6 +7734,18 @@ def evolve_afpo(population, X, y_target, type_code,
 
             hof_best = hof.get_best_overall()
             if hof_best is not None and not _semantic_collapsed:
+                # ── Residual-aware seed injection ──────────────────────────
+                # Generate seeds targeting the HoF best's error patterns
+                try:
+                    res_seeds = generate_residual_aware_seeds(
+                        n_features, feat_names, X, y_target, hof_best,
+                        max_seeds=max(5, int(target_size * 0.15)))
+                    for rs in res_seeds:
+                        rs.age = 0
+                    new_blood.extend(res_seeds)
+                except Exception:
+                    pass
+
                 # Normal case: inject diversity cloud around the best solution
                 n_directed = max(3, int(target_size * 0.20))
                 for k in range(n_directed):
@@ -7238,6 +7777,18 @@ def evolve_afpo(population, X, y_target, type_code,
                 # Semantic collapse: the HoF best dominates so completely that
                 # mutations of it all land in the same basin.  Skip HoF injection
                 # and add extra random+seed diversity to force structural exploration.
+                # Also inject residual-aware seeds to escape the basin.
+                hof_best = hof.get_best_overall()
+                if hof_best is not None:
+                    try:
+                        res_seeds = generate_residual_aware_seeds(
+                            n_features, feat_names, X, y_target, hof_best,
+                            max_seeds=max(5, int(target_size * 0.15)))
+                        for rs in res_seeds:
+                            rs.age = 0
+                        new_blood.extend(res_seeds)
+                    except Exception:
+                        pass
                 extra = max(3, int(target_size * 0.15))
                 for _ in range(extra):
                     new_blood.append(Individual(
