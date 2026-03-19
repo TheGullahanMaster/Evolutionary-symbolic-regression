@@ -3060,26 +3060,59 @@ class HallOfFame:
         return scores
     def get_best_overall(self):
         if not self.best_by_complexity: return None
-        
+
         # 1. THE ABSOLUTE OVERRIDE
         # If any model has functionally zero loss, it is a perfect solution.
         # Ignore PySR derivatives and just return the simplest perfect model.
         perfect_models = [ind for ind in self.best_by_complexity.values() if ind.loss < 1e-5]
         if perfect_models:
             return min(perfect_models, key=lambda x: x.complexity)
-            
+
         # 2. Normal PySR scoring for typical (non-perfect) frontiers
         scores = self.compute_pysr_scores()
         if not scores:
             return min(self.best_by_complexity.values(), key=lambda x: x.loss)
-            
+
         best_c = max(scores, key=scores.get)
-        
+
         # Fallback to absolute lowest loss if no meaningful scores exist
         if scores[best_c] == 0.0:
              return min(self.best_by_complexity.values(), key=lambda x: x.loss)
-             
-        return self.best_by_complexity[best_c]
+
+        score_pick = self.best_by_complexity[best_c]
+
+        # 3. R²-AWARE OVERRIDE
+        # The PySR score rewards *marginal* loss improvement per complexity unit.
+        # This can pick a simple but poorly-fitting model (e.g. R²=0.25) over a
+        # much better model (e.g. R²=0.96) just because the score derivative was
+        # higher at the simpler end.  Fix: if the best-R² model on the frontier
+        # has a substantially higher R² than the score-picked model, prefer it —
+        # but only when the R² gap is large enough to clearly indicate a better
+        # model, not just a marginal gain from over-fitting extra complexity.
+        all_inds = list(self.best_by_complexity.values())
+        # Use R² for regression; for classification this attribute is 0.0 so
+        # the override won't trigger (classification uses accuracy instead).
+        score_r2 = getattr(score_pick, 'r2', 0.0)
+
+        # Find the model with the best R² on the frontier
+        best_r2_ind = max(all_inds, key=lambda x: getattr(x, 'r2', 0.0))
+        best_r2 = getattr(best_r2_ind, 'r2', 0.0)
+
+        if best_r2 > score_r2:
+            r2_gap = best_r2 - score_r2
+            # Adaptive threshold: the required R² gap shrinks as overall R²
+            # increases (near-perfect models need smaller gaps to matter).
+            # At R²~0.0 the threshold is 0.15; at R²~1.0 it's 0.02.
+            threshold = max(0.02, 0.15 * (1.0 - best_r2))
+
+            if r2_gap > threshold:
+                # Among all models with R² close to the best (within 0.01),
+                # prefer the simplest one — Occam's razor still applies.
+                near_best = [ind for ind in all_inds
+                             if getattr(ind, 'r2', 0.0) >= best_r2 - 0.01]
+                return min(near_best, key=lambda x: x.complexity)
+
+        return score_pick
 
 
     def print_frontier(self, out_type=5, label=""):
@@ -3124,7 +3157,7 @@ class HallOfFame:
                 best_eq_str = f"({a:.4g} * ({best.tree}) {sign} {abs(b):.4g})"
 
             print("-" * 100)
-            print("🏆 BEST OVERALL MODEL (Highest PySR Score) 🏆")
+            print("🏆 BEST OVERALL MODEL (Score + R² Balanced) 🏆")
             print(f"  Complexity: {best.complexity:.1f}  |  Score: {best_score:.4f}  |  Loss: {best.loss:.5f}  |  {metric_label}: {metric_val:.4f}")
             print(f"  Expression: {best_eq_str}")
         print("=" * 100 + "\n")
@@ -7309,13 +7342,17 @@ def evolve_island_chunk(args):
         for ind in island_pop:
             ind.age += 1
 
-        # ── PySR-style SA temperature ─────────────────────────────────────────
-        # T = SA_ALPHA × mean_population_loss.  High T early (bad population)
-        # → broad exploration.  T → 0 as loss → 0 → pure exploitation.
+        # ── PySR-style SA temperature with cosine annealing ─────────────────
+        # Base temperature: T_base = SA_ALPHA × mean_population_loss.
+        # Cosine schedule multiplier decays from 1.0 → 0.1 over the run,
+        # ensuring broad exploration early and precise exploitation late
+        # even when the mean loss plateaus (which would keep T_base flat).
         valid_losses = [ind.loss for ind in island_pop
                         if np.isfinite(ind.loss) and ind.loss < 1e9]
         mean_loss    = float(np.mean(valid_losses)) if valid_losses else 1.0
-        sa_temp      = SA_ALPHA * mean_loss if SA_ENABLED else 0.0
+        gen_frac     = gen / max(1, generations - 1)
+        cosine_decay = 0.1 + 0.9 * 0.5 * (1.0 + np.cos(np.pi * gen_frac))
+        sa_temp      = SA_ALPHA * mean_loss * cosine_decay if SA_ENABLED else 0.0
 
         # ── PySR adaptive complexity frequency parsimony ──────────────────────
         # Penalise over-crowded complexities; reward under-represented ones.
@@ -7561,6 +7598,24 @@ def evolve_island_chunk(args):
                         hof_best.sigma * random.uniform(0.8, 1.5),
                         SIGMA_MIN, SIGMA_MAX))
                     new_blood.append(ni)
+
+                # ── Elite crossover: combine structural motifs from different
+                # HoF complexity levels.  This lets extinction inject individuals
+                # that inherit useful sub-expressions from both simple and complex
+                # models, bridging the gap between them on the Pareto frontier.
+                hof_inds = list(local_hof.best_by_complexity.values())
+                if len(hof_inds) >= 2:
+                    n_elite_xover = max(2, int(len(island_pop) * 0.08))
+                    for _ in range(n_elite_xover):
+                        p1, p2 = random.sample(hof_inds, 2)
+                        child_tree = crossover(p1.tree, p2.tree)
+                        child_tree = mutate(child_tree, n_features, feat_names,
+                                            mut_rate=max(1, CGP_MUT_RATE))
+                        ni = Individual(child_tree)
+                        ni.sigma = float(np.clip(
+                            (p1.sigma + p2.sigma) / 2.0 * random.uniform(0.7, 1.5),
+                            SIGMA_MIN, SIGMA_MAX))
+                        new_blood.append(ni)
 
             while len(survivors) + len(new_blood) < len(island_pop):
                 new_blood.append(Individual(
@@ -8613,6 +8668,11 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
     iteration = 0
     total_evals = BAYESIAN_INITIAL_SAMPLES * n_outputs
     perfect_outputs = set()
+    # Adaptive exploration: start at 5× the configured xi for broad
+    # exploration, then decay toward the configured value over iterations.
+    # This avoids premature exploitation when the GP model is uncertain.
+    _bo_xi_start = max(BAYESIAN_EXPLORATION * 5.0, 0.05)
+    _bo_xi_end   = BAYESIAN_EXPLORATION
 
     try:
         while True:
@@ -8621,6 +8681,14 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
                          if BATCH_SIZE > 0 else None)
             X_b = X[batch_idx] if batch_idx is not None else X
             Y_b = Y[batch_idx] if batch_idx is not None else Y
+
+            # ── Adaptive exploration decay ────────────────────────────────
+            # Exponential decay from _bo_xi_start toward _bo_xi_end over
+            # ~200 iterations (half-life ~50 iterations).
+            decay = np.exp(-0.014 * iteration)  # ~50 iteration half-life
+            current_xi = _bo_xi_end + (_bo_xi_start - _bo_xi_end) * decay
+            for opt in optimizers:
+                opt.xi = current_xi
 
             for o_idx in range(n_outputs):
                 if o_idx in perfect_outputs:
@@ -8673,17 +8741,60 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
                         ct = macro_trig_identity(parent.tree, n_features)
                     candidate_trees.append(ct)
 
-                # 15% purely random (diversity injection)
-                n_random = BAYESIAN_N_CANDIDATES - n_exploit - n_cross - n_macro
-                for _ in range(n_random):
+                # 10% from HoF elite crossover — recombine structural motifs
+                # from different complexity levels of the Hall of Fame.
+                n_hof_cross = int(BAYESIAN_N_CANDIDATES * 0.10)
+                hof_inds_bo = list(hofs[o_idx].best_by_complexity.values())
+                if len(hof_inds_bo) >= 2:
+                    for _ in range(n_hof_cross):
+                        p1, p2 = random.sample(hof_inds_bo, 2)
+                        child_tree = crossover(p1.tree, p2.tree)
+                        child_tree = mutate(child_tree, n_features, feat_names,
+                                            mut_rate=random.choice([1, 2]))
+                        candidate_trees.append(child_tree)
+                else:
+                    # Not enough HoF entries; fill with random
+                    for _ in range(n_hof_cross):
+                        candidate_trees.append(
+                            random_cgp(n_features, CGP_NODES, feat_names))
+
+                # 5% purely random (diversity injection)
+                n_random = BAYESIAN_N_CANDIDATES - n_exploit - n_cross - n_macro - n_hof_cross
+                for _ in range(max(0, n_random)):
                     candidate_trees.append(
                         random_cgp(n_features, CGP_NODES, feat_names))
 
                 # ── Score candidates with Expected Improvement ──────────────
                 ei_scores = opt.score_candidates(candidate_trees)
 
-                # ── Select top-B candidates to evaluate ─────────────────────
-                top_indices = np.argsort(ei_scores)[-BAYESIAN_BATCH_SIZE:]
+                # ── Multi-fidelity evaluation ─────────────────────────────
+                # Stage 1: evaluate top 2×B candidates on a cheap subset
+                # Stage 2: re-evaluate the best B on full data
+                # This halves the cost of full evaluations per iteration.
+                n_screen = min(BAYESIAN_BATCH_SIZE * 2, len(candidate_trees))
+                screen_indices = np.argsort(ei_scores)[-n_screen:]
+
+                _N = X_b.shape[0]
+                _screen_rows = min(max(50, _N // 4), _N)
+                if _screen_rows < _N:
+                    _screen_idx = np.random.choice(_N, _screen_rows, replace=False)
+                    X_screen = X_b[_screen_idx]
+                    Y_screen = Y_b[_screen_idx]
+                else:
+                    X_screen, Y_screen = X_b, Y_b
+
+                # Stage 1: cheap screening
+                screen_results = []
+                for ci in screen_indices:
+                    child = Individual(candidate_trees[ci])
+                    child.calculate_fitness(
+                        X_screen, Y_screen[:, o_idx], out_types[o_idx],
+                        target_grads=target_grads_list[o_idx])
+                    screen_results.append((ci, child))
+
+                # Stage 2: pick best B from screening, evaluate on full data
+                screen_results.sort(key=lambda x: x[1].loss)
+                top_indices = [ci for ci, _ in screen_results[:BAYESIAN_BATCH_SIZE]]
 
                 n_improved = 0
                 for ci in top_indices:
