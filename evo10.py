@@ -572,6 +572,13 @@ def affinity_biased_op_choice(affinity: dict, ops: list | None = None) -> str:
 
 SAFE_OPS_MODE = True  # default; changed interactively at startup
 
+# ---- Affine Scaling ----
+# When enabled (default), every regression individual gets an analytic
+# affine rescaling y = a*f(x) + b, fitted once on the full dataset.
+# This lets the evolutionary search focus on shape rather than scale.
+# Disabling forces the CGP to learn scale/offset from constants alone.
+AFFINE_SCALING_ENABLED = True
+
 # ---- helpers used by SAFE variants ----
 def _sinc_fn(v):
     mask = np.abs(v) > 1e-8
@@ -2959,19 +2966,22 @@ class HallOfFame:
         are now cross-complexity Pareto-dominated.
 
         A slot at complexity C2 is dominated if there EXISTS a slot at C1 where:
-            C1 <= C2  AND  loss(C1) <= loss(C2)   (simpler AND at least as good)
+            C1 < C2  AND  loss(C1) <= loss(C2)   (strictly simpler AND at least as good)
+         OR C1 <= C2 AND  loss(C1) <  loss(C2)   (at most as complex AND strictly better)
 
-        This immediately clears zombie entries like:
-          comp=13, loss=0.723  →  evicts comp=14, loss=0.755
-          comp=30, loss=6.00   →  evicted by any valid lower-complexity slot
+        Using strict inequality on at least one axis prevents wiping entries
+        that tie on loss but differ in complexity — those represent distinct
+        Pareto-front points that evolution may build on later.
         """
         ref_loss = self.best_by_complexity[ref_complexity].loss
         to_remove = []
         for c, ind in self.best_by_complexity.items():
             if c == ref_complexity:
                 continue
-            # Can ref evict c? (ref is simpler and at least as good)
-            if ref_complexity <= c and ref_loss <= ind.loss:
+            # Can ref evict c?  Require strictly better on at least one axis.
+            if ref_complexity < c and ref_loss <= ind.loss:
+                to_remove.append(c)
+            elif ref_complexity <= c and ref_loss < ind.loss:
                 to_remove.append(c)
             # Can c evict ref? (c is simpler and strictly better)
             elif c < ref_complexity and ind.loss < ref_loss:
@@ -3008,15 +3018,17 @@ class HallOfFame:
         # Pass 2: build a clean Pareto front (simpler-is-better on complexity,
         # lower-is-better on loss).  Walk complexity in ascending order;
         # track the running minimum loss seen so far.  Any entry whose loss
-        # is >= that minimum is dominated and gets dropped.
+        # is strictly greater than that minimum is dominated and gets dropped.
+        # Entries with EQUAL loss at higher complexity are kept — they represent
+        # structurally different solutions that may improve independently later.
         sorted_entries = sorted(self.best_by_complexity.items())   # by complexity asc
         clean = {}
         best_loss_seen = float('inf')
         for c, ind in sorted_entries:
-            if ind.loss < best_loss_seen:
+            if ind.loss <= best_loss_seen:
                 clean[c] = ind
                 best_loss_seen = ind.loss
-            # else: this slot is dominated — skip it (don't add to clean)
+            # else: this slot is strictly dominated — skip it
 
         self.best_by_complexity = clean
         removed = before - len(self.best_by_complexity)
@@ -5645,6 +5657,12 @@ class Individual:
                 # This prevents the affine from drifting across different batches
                 # and ensures constant optimisation cannot "cheat" by implicitly
                 # rescaling via the affine as a free parameter.
+                # When AFFINE_SCALING_ENABLED is False, keep identity (a=1, b=0)
+                # and lock immediately so the CGP must learn scale from constants.
+                if not AFFINE_SCALING_ENABLED and not self.affine_fitted:
+                    self.affine_a = 1.0
+                    self.affine_b = 0.0
+                    self.affine_fitted = True
                 if update_affine and not self.affine_fitted:
                     # Reuse existing preds when evaluating on the full dataset
                     # (batch_indices is None) — avoids a redundant evaluate() call,
@@ -5664,10 +5682,15 @@ class Individual:
                         cov           = float(np.mean((preds_full - p_mean) * (y_target - y_mean_full)))
                         self.affine_a = float(cov / p_var)
                         self.affine_b = float(y_mean_full - self.affine_a * p_mean)
+                        self.affine_fitted = True
                     else:
-                        self.affine_a = 0.0
-                        self.affine_b = float(np.mean(y_target))
-                    self.affine_fitted = True
+                        # Tree output is near-constant: use identity affine (a=1, b=0)
+                        # but do NOT lock — after mutation changes the tree to produce
+                        # variable output, the affine should be re-fitted on the next
+                        # full-data evaluation.  Locking (0, mean_y) here would
+                        # permanently kill the individual even after structural mutation.
+                        self.affine_a = 1.0
+                        self.affine_b = 0.0
 
                 # Apply the locked affine to the (possibly batched) predictions
                 preds  = self.affine_a * preds + self.affine_b
@@ -10136,6 +10159,27 @@ def train_mode():
     # ---- Safe vs Unsafe ops ----
     select_ops_safety()
 
+    # ---- Affine scaling toggle ----
+    global AFFINE_SCALING_ENABLED
+    print("\n" + "─" * 60)
+    print("AFFINE SCALING")
+    print("  When enabled (default), each regression expression is auto-scaled:")
+    print("    y = a * f(x) + b    (a, b fitted analytically once)")
+    print("  This lets evolution focus on the shape of f(x) rather than its")
+    print("  magnitude, dramatically speeding up convergence for most problems.")
+    print()
+    print("  When disabled, the CGP must learn scale/offset from its own")
+    print("  constants.  Use this if you need the raw symbolic expression")
+    print("  without an outer affine wrapper.")
+    print("─" * 60)
+    aff_choice = input("Enable affine scaling? [Y/n]: ").strip().lower()
+    if aff_choice.startswith('n'):
+        AFFINE_SCALING_ENABLED = False
+        print("  ✓  Affine scaling DISABLED — CGP must learn scale from constants.")
+    else:
+        AFFINE_SCALING_ENABLED = True
+        print("  ✓  Affine scaling ENABLED (default).")
+
     # ---- CGP node count ----
     print("\n─" * 30)
     print("CGP NODE COUNT")
@@ -10954,6 +10998,20 @@ def train_mode():
                                 hofs[o_idx], X, Y[:, o_idx], out_types[o_idx],
                                 target_grads=target_grads_list[o_idx])
 
+                    # ---- Periodic HoF re-scoring on full data (batch mode) ----
+                    # When BATCH_SIZE > 0, island workers fit affine on batch data
+                    # (they see X_b as their "full" dataset).  Periodically re-score
+                    # all HoF entries on the true full dataset so affine parameters
+                    # are accurate and entries are correctly ranked.
+                    if BATCH_SIZE > 0 and gen > 0 and gen % 200 == 0:
+                        for o_idx, hof in enumerate(hofs):
+                            for ind in hof.best_by_complexity.values():
+                                ind.affine_fitted = False
+                                ind.calculate_fitness(
+                                    X, Y[:, o_idx], out_types[o_idx],
+                                    update_affine=True,
+                                    target_grads=target_grads_list[o_idx])
+
                     # ---- Deep constant optimisation ----
                     if gen > 0 and gen % 1000 == 0:
                         _deep_optimize_hofs(hofs, X, Y, out_types)
@@ -11167,6 +11225,16 @@ def train_mode():
                         _simplify_perfect_output(
                             hofs[o_idx], X, Y[:, o_idx], out_types[o_idx],
                             target_grads=target_grads_list[o_idx])
+
+                # ---- Periodic HoF re-scoring on full data (batch mode) ----
+                if BATCH_SIZE > 0 and gen > 0 and gen % 200 == 0:
+                    for o_idx, hof in enumerate(hofs):
+                        for ind in hof.best_by_complexity.values():
+                            ind.affine_fitted = False
+                            ind.calculate_fitness(
+                                X, Y[:, o_idx], out_types[o_idx],
+                                update_affine=True,
+                                target_grads=target_grads_list[o_idx])
 
                 # ---- Deep constant optimisation ----
                 if gen > 0 and gen % 1000 == 0:
@@ -11486,6 +11554,16 @@ def train_mode():
                             _simplify_perfect_output(
                                 hofs[o_idx], X, Y[:, o_idx], out_types[o_idx],
                                 target_grads=target_grads_list[o_idx])
+
+                    # ---- Periodic HoF re-scoring on full data (batch mode) ----
+                    if BATCH_SIZE > 0 and gen > 0 and gen % 200 == 0:
+                        for o_idx, hof in enumerate(hofs):
+                            for ind in hof.best_by_complexity.values():
+                                ind.affine_fitted = False
+                                ind.calculate_fitness(
+                                    X, Y[:, o_idx], out_types[o_idx],
+                                    update_affine=True,
+                                    target_grads=target_grads_list[o_idx])
 
                     # ---- Deep constant optimisation ----
                     if gen > 0 and gen % 1000 == 0:
@@ -11821,6 +11899,16 @@ def train_mode():
                             _simplify_perfect_output(
                                 hofs[o_idx], X, Y[:, o_idx], out_types[o_idx],
                                 target_grads=target_grads_list[o_idx])
+
+                    # ---- Periodic HoF re-scoring on full data (batch mode) ----
+                    if BATCH_SIZE > 0 and gen > 0 and gen % 200 == 0:
+                        for o_idx, hof in enumerate(hofs):
+                            for ind in hof.best_by_complexity.values():
+                                ind.affine_fitted = False
+                                ind.calculate_fitness(
+                                    X, Y[:, o_idx], out_types[o_idx],
+                                    update_affine=True,
+                                    target_grads=target_grads_list[o_idx])
 
                     # ---- Deep constant optimisation ----
                     if gen > 0 and gen % 1000 == 0:
