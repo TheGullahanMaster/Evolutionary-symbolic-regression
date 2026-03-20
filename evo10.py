@@ -6762,11 +6762,29 @@ def predict(input_dict):
     return dp.inverse_transform_output(y_pred[0])
 
 
+def _sanitize_filename(name):
+    """Replace characters that are unsafe for filenames with safe variants."""
+    import re as _re
+    # Replace common unsafe chars with descriptive alternatives
+    replacements = {{'/': '_div_', '\\\\': '_bslash_', ':': '_', '*': '_star_',
+                    '?': '_', '"': '_', '<': '_lt_', '>': '_gt_', '|': '_pipe_',
+                    ' ': '_'}}
+    for ch, repl in replacements.items():
+        name = name.replace(ch, repl)
+    # Remove any remaining non-alphanumeric chars (except - _ .)
+    name = _re.sub(r'[^\\w.\\-]', '_', name)
+    # Collapse multiple underscores
+    name = _re.sub(r'_+', '_', name).strip('_')
+    return name if name else 'unnamed'
+
+
 def plot_model():
-    """Interactive plotting of model outputs vs inputs (1D and 2D)."""
+    """Generate plots of model outputs vs inputs (1D and 2D) and save to evo_plots/."""
+    import os
+    import shutil
     try:
         import matplotlib
-        matplotlib.use("TkAgg")
+        matplotlib.use("Agg")
     except Exception:
         pass
     try:
@@ -6794,9 +6812,24 @@ def plot_model():
         feat_mins[idx] = fmin
         feat_maxs[idx] = fmax
 
+    # Prepare output directory
+    plot_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "evo_plots")
+    if os.path.exists(plot_dir):
+        shutil.rmtree(plot_dir)
+    os.makedirs(plot_dir)
+
+    # Create per-output subdirectories
+    out_dirs = {{}}
+    for out_idx in range(n_out):
+        safe_name = _sanitize_filename(OUTPUT_NAMES[out_idx])
+        out_path = os.path.join(plot_dir, safe_name)
+        os.makedirs(out_path, exist_ok=True)
+        out_dirs[out_idx] = out_path
+
     print("\\n--- MODEL PLOTTING ---")
     print(f"Features ({{n_feat}}): {{', '.join(FEATURE_NAMES)}}")
     print(f"Outputs  ({{n_out}}): {{', '.join(OUTPUT_NAMES)}}")
+    print(f"Saving plots to: {{plot_dir}}")
 
     # Ask user for custom frozen values
     print("\\nFrozen input defaults (mean of training data):")
@@ -6812,6 +6845,8 @@ def plot_model():
                     feat_defaults[idx] = float(val)
                 except ValueError:
                     pass
+
+    plot_count = 0
 
     # 1D plots: each feature vs each output
     print("\\nGenerating 1D plots (each input vs each output)...")
@@ -6840,6 +6875,10 @@ def plot_model():
                         bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
             ax.grid(True, alpha=0.3)
             plt.tight_layout()
+            fname = f"{{_sanitize_filename(OUTPUT_NAMES[out_idx])}}_vs_{{_sanitize_filename(FEATURE_NAMES[feat_idx])}}.png"
+            fig.savefig(os.path.join(out_dirs[out_idx], fname), dpi=150)
+            plt.close(fig)
+            plot_count += 1
 
     # 2D plots: each pair of features vs each output
     if n_feat >= 2:
@@ -6877,8 +6916,12 @@ def plot_model():
                                 fontsize=7, verticalalignment='top',
                                 bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
                     plt.tight_layout()
+                    fname = f"{{_sanitize_filename(OUTPUT_NAMES[out_idx])}}_vs_{{_sanitize_filename(FEATURE_NAMES[i])}}_and_{{_sanitize_filename(FEATURE_NAMES[j])}}.png"
+                    fig.savefig(os.path.join(out_dirs[out_idx], fname), dpi=150)
+                    plt.close(fig)
+                    plot_count += 1
 
-    plt.show()
+    print(f"Saved {{plot_count}} plots to {{plot_dir}}")
 
 
 def main():
@@ -10050,11 +10093,29 @@ def predict_raw(X):
     return y_pred
 
 
+def _sanitize_filename(name):
+    """Replace characters that are unsafe for filenames with safe variants."""
+    import re as _re
+    # Replace common unsafe chars with descriptive alternatives
+    replacements = {{'/': '_div_', '\\\\': '_bslash_', ':': '_', '*': '_star_',
+                    '?': '_', '"': '_', '<': '_lt_', '>': '_gt_', '|': '_pipe_',
+                    ' ': '_'}}
+    for ch, repl in replacements.items():
+        name = name.replace(ch, repl)
+    # Remove any remaining non-alphanumeric chars (except - _ .)
+    name = _re.sub(r'[^\\w.\\-]', '_', name)
+    # Collapse multiple underscores
+    name = _re.sub(r'_+', '_', name).strip('_')
+    return name if name else 'unnamed'
+
+
 def plot_model():
-    """Interactive plotting of model outputs vs inputs (1D and 2D)."""
+    """Generate plots of model outputs vs inputs (1D and 2D) and save to evo_plots/."""
+    import os
+    import shutil
     try:
         import matplotlib
-        matplotlib.use("TkAgg")
+        matplotlib.use("Agg")
     except Exception:
         pass
     try:
@@ -10082,9 +10143,24 @@ def plot_model():
         feat_mins[idx] = fmin
         feat_maxs[idx] = fmax
 
+    # Prepare output directory
+    plot_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "evo_plots")
+    if os.path.exists(plot_dir):
+        shutil.rmtree(plot_dir)
+    os.makedirs(plot_dir)
+
+    # Create per-output subdirectories
+    out_dirs = {{}}
+    for out_idx in range(n_out):
+        safe_name = _sanitize_filename(OUTPUT_NAMES[out_idx])
+        out_path = os.path.join(plot_dir, safe_name)
+        os.makedirs(out_path, exist_ok=True)
+        out_dirs[out_idx] = out_path
+
     print("\\n--- MODEL PLOTTING ---")
     print(f"Features ({{n_feat}}): {{', '.join(FEATURE_NAMES)}}")
     print(f"Outputs  ({{n_out}}): {{', '.join(OUTPUT_NAMES)}}")
+    print(f"Saving plots to: {{plot_dir}}")
 
     # Ask user for custom frozen values
     print("\\nFrozen input defaults (mean of training data):")
@@ -10100,6 +10176,8 @@ def plot_model():
                     feat_defaults[idx] = float(val)
                 except ValueError:
                     pass
+
+    plot_count = 0
 
     # 1D plots: each feature vs each output
     print("\\nGenerating 1D plots (each input vs each output)...")
@@ -10128,6 +10206,10 @@ def plot_model():
                         bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
             ax.grid(True, alpha=0.3)
             plt.tight_layout()
+            fname = f"{{_sanitize_filename(OUTPUT_NAMES[out_idx])}}_vs_{{_sanitize_filename(FEATURE_NAMES[feat_idx])}}.png"
+            fig.savefig(os.path.join(out_dirs[out_idx], fname), dpi=150)
+            plt.close(fig)
+            plot_count += 1
 
     # 2D plots: each pair of features vs each output
     if n_feat >= 2:
@@ -10165,8 +10247,12 @@ def plot_model():
                                 fontsize=7, verticalalignment='top',
                                 bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
                     plt.tight_layout()
+                    fname = f"{{_sanitize_filename(OUTPUT_NAMES[out_idx])}}_vs_{{_sanitize_filename(FEATURE_NAMES[i])}}_and_{{_sanitize_filename(FEATURE_NAMES[j])}}.png"
+                    fig.savefig(os.path.join(out_dirs[out_idx], fname), dpi=150)
+                    plt.close(fig)
+                    plot_count += 1
 
-    plt.show()
+    print(f"Saved {{plot_count}} plots to {{plot_dir}}")
 
 
 def main():
