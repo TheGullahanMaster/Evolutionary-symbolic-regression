@@ -2847,39 +2847,48 @@ class CGPEquation:
         self.update_active_nodes()
         cost = 0.0
         unique_features_used = set()
-        
-        # Define forbidden nestings: { outer_op : [forbidden_inner_ops] }
+
+        # Define nested constraints with graduated penalties instead of a
+        # hard 1000-point wall.  Each entry maps outer_op → list of
+        # (forbidden_inner_ops, penalty) pairs.  The penalty scales with how
+        # numerically dangerous the nesting is:
+        #   • Severe (exp∘exp, pow∘exp) → 50   — can overflow to Inf quickly
+        #   • Moderate (trig∘trig, log∘log) → 30 — hard to interpret, rarely useful
+        #   • Mild (square∘square, log∘exp cancel) → 20 — occasionally useful
+        # This replaces the old 1000-point cliff, allowing evolution to explore
+        # nested structures if they substantially reduce loss, while still
+        # preferring simpler alternatives at similar accuracy.
         nested_constraints = {
-            'exp': ['exp'],
-            'sin': ['sin', 'cos', 'tan'],
-            'cos': ['sin', 'cos', 'tan'],
-            'tan': ['sin', 'cos', 'tan'],
-            'pow': ['pow', 'exp'], # prevent (x^a)^b or (e^x)^a
-            'square': ['square', 'cube'],   # prevent (x²)²
-            'log': ['log', 'log10', 'exp'], # prevent log(log(x)) or log(exp(x))
+            'exp': [(['exp'], 50.0)],                          # exp(exp(x)) overflows
+            'sin': [(['sin', 'cos', 'tan'], 30.0)],           # trig(trig(x)) rarely useful
+            'cos': [(['sin', 'cos', 'tan'], 30.0)],
+            'tan': [(['sin', 'cos', 'tan'], 30.0)],
+            'pow': [(['pow'], 40.0), (['exp'], 50.0)],        # (x^a)^b = x^(a*b), exp^pow overflows
+            'square': [(['square', 'cube'], 20.0)],            # (x²)² = x⁴, just use pow
+            'log': [(['log', 'log10'], 30.0), (['exp'], 20.0)], # log(exp(x))=x, log(log(x)) domain issues
         }
-        
+
         for idx in self.active_nodes:
             if idx >= self.n_features:
                 node = self.nodes[idx - self.n_features]
                 cost += OP_COSTS.get(node.op, COST_OP_COMPLEX)
-                
-                # Check nested constraints
+
+                # Check nested constraints — graduated penalties
                 if node.op in nested_constraints:
-                    forbidden_inners = nested_constraints[node.op]
-                    # Check in1
-                    if node.in1 >= self.n_features and self.nodes[node.in1 - self.n_features].op in forbidden_inners:
-                        cost += 1000.0 # Massive penalty
-                    # Check in2
-                    if node.op in self.OPS_BINARY_SET and node.in2 >= self.n_features:
-                        if self.nodes[node.in2 - self.n_features].op in forbidden_inners:
-                            cost += 1000.0
+                    for forbidden_inners, penalty in nested_constraints[node.op]:
+                        # Check in1
+                        if (node.in1 >= self.n_features
+                                and node.in1 - self.n_features < len(self.nodes)
+                                and self.nodes[node.in1 - self.n_features].op in forbidden_inners):
+                            cost += penalty
+                        # Check in2 (for binary ops)
+                        if node.op in self.OPS_BINARY_SET and node.in2 >= self.n_features:
+                            if (node.in2 - self.n_features < len(self.nodes)
+                                    and self.nodes[node.in2 - self.n_features].op in forbidden_inners):
+                                cost += penalty
             else:
                 unique_features_used.add(idx)
 
-        #FEATURE_L0_PENALTY = 2.0 
-        #cost += FEATURE_L0_PENALTY * (len(unique_features_used) ** 1.5)
-        
         return cost
 
     def __str__(self):
@@ -3203,8 +3212,8 @@ def random_cgp(n_features, max_nodes, feature_names):
     return eq
 
 
-def _make_cgp_base(n_features, feature_names):
-    return random_cgp(n_features, CGP_NODES, feature_names)
+def _make_cgp_base(n_features, feature_names, max_nodes=None):
+    return random_cgp(n_features, max_nodes or CGP_NODES, feature_names)
 
 
 def _build_seed(n_features, feature_names, node_specs, out_offset=None):
@@ -4559,10 +4568,297 @@ def generate_seeds_v5(n_features, feature_names):
         cgp.out_idx = n_features + 4; cgp.update_active_nodes()
         seeds.append(Individual(cgp))
 
+    # ================================================================
+    # 63–79. PHYSICS / MATH DISCOVERY SEEDS
+    # ================================================================
+    # Common patterns from physics and applied math that are extremely
+    # hard to discover by mutation alone because they require specific
+    # multi-node structures to be assembled simultaneously.
+
+    # 63. Coulomb / gravitational: c / r²  (inverse square law)
+    if '/' in allowed and 'const' in allowed:
+        for fi in range(min(n_features, 3)):
+            cgp = _make_cgp_base(n_features, feature_names)
+            nf = n_features
+            cgp.nodes[0] = CGPNode('const', 0, 0, random.uniform(0.5, 10.0))
+            cgp.nodes[1] = CGPNode('*', fi, fi)                              # r²
+            cgp.nodes[2] = CGPNode('/', nf, nf + 1)                          # c / r²
+            cgp.out_idx = nf + 2; cgp.update_active_nodes()
+            seeds.append(Individual(cgp))
+
+    # 64. Inverse-distance: c / sqrt(x1² + x2²)  (2D Coulomb)
+    if n_features >= 2 and '/' in allowed and 'const' in allowed:
+        cgp = _make_cgp_base(n_features, feature_names)
+        fi, fj = random.sample(range(n_features), 2)
+        nf = n_features
+        cgp.nodes[0] = CGPNode('*', fi, fi)                                  # x1²
+        cgp.nodes[1] = CGPNode('*', fj, fj)                                  # x2²
+        cgp.nodes[2] = CGPNode('+', nf, nf + 1)                              # x1² + x2²
+        cgp.nodes[3] = CGPNode('sqrt', nf + 2, 0) if 'sqrt' in allowed else CGPNode('pow', nf + 2, nf + 4)
+        cgp.nodes[4] = CGPNode('const', 0, 0, 0.5 if 'sqrt' not in allowed else 1.0)
+        cgp.nodes[5] = CGPNode('const', 0, 0, random.uniform(0.5, 10.0))
+        out_node = nf + 3 if 'sqrt' in allowed else nf + 3
+        cgp.nodes[6] = CGPNode('/', nf + 5, out_node)                        # c / sqrt(x1²+x2²)
+        cgp.out_idx = nf + 6; cgp.update_active_nodes()
+        seeds.append(Individual(cgp))
+
+    # 65. Hooke's law / spring: c * (x - x0)²  (harmonic potential)
+    if '*' in allowed and '-' in allowed and 'const' in allowed:
+        for fi in range(min(n_features, 3)):
+            cgp = _make_cgp_base(n_features, feature_names)
+            nf = n_features
+            cgp.nodes[0] = CGPNode('const', 0, 0, random.uniform(-3.0, 3.0))  # equilibrium x0
+            cgp.nodes[1] = CGPNode('-', fi, nf)                                # x - x0
+            cgp.nodes[2] = CGPNode('*', nf + 1, nf + 1)                       # (x - x0)²
+            cgp.nodes[3] = CGPNode('const', 0, 0, random.uniform(0.1, 5.0))   # spring constant k
+            cgp.nodes[4] = CGPNode('*', nf + 3, nf + 2)                       # k * (x - x0)²
+            cgp.out_idx = nf + 4; cgp.update_active_nodes()
+            seeds.append(Individual(cgp))
+
+    # 66. Wave equation: A * sin(k*x - ω*t)  (travelling wave, 2 features)
+    if (n_features >= 2 and 'sin' in allowed and '*' in allowed
+            and '-' in allowed and 'const' in allowed):
+        cgp = _make_cgp_base(n_features, feature_names)
+        fi, fj = random.sample(range(n_features), 2)
+        nf = n_features
+        cgp.nodes[0] = CGPNode('const', 0, 0, random.uniform(0.5, 5.0))    # wavenumber k
+        cgp.nodes[1] = CGPNode('*', nf, fi)                                  # k*x
+        cgp.nodes[2] = CGPNode('const', 0, 0, random.uniform(0.5, 5.0))    # frequency ω
+        cgp.nodes[3] = CGPNode('*', nf + 2, fj)                              # ω*t
+        cgp.nodes[4] = CGPNode('-', nf + 1, nf + 3)                          # k*x - ω*t
+        cgp.nodes[5] = CGPNode('sin', nf + 4, 0)                             # sin(k*x - ω*t)
+        cgp.nodes[6] = CGPNode('const', 0, 0, random.uniform(0.5, 5.0))    # amplitude A
+        cgp.nodes[7] = CGPNode('*', nf + 6, nf + 5)                          # A * sin(...)
+        cgp.out_idx = nf + 7; cgp.update_active_nodes()
+        seeds.append(Individual(cgp))
+
+    # 67. Gaussian / normal distribution: c * exp(-((x - μ)/σ)²)
+    if 'gaussian' in allowed and '-' in allowed and '*' in allowed and 'const' in allowed:
+        for fi in range(min(n_features, 3)):
+            cgp = _make_cgp_base(n_features, feature_names)
+            nf = n_features
+            cgp.nodes[0] = CGPNode('const', 0, 0, random.uniform(-3.0, 3.0))  # mean μ
+            cgp.nodes[1] = CGPNode('-', fi, nf)                                 # x - μ
+            cgp.nodes[2] = CGPNode('const', 0, 0, random.uniform(0.3, 3.0))   # 1/σ
+            cgp.nodes[3] = CGPNode('*', nf + 2, nf + 1)                        # (x-μ)/σ
+            cgp.nodes[4] = CGPNode('gaussian', nf + 3, 0)                      # exp(-((x-μ)/σ)²)
+            cgp.nodes[5] = CGPNode('const', 0, 0, random.uniform(0.5, 5.0))   # amplitude
+            cgp.nodes[6] = CGPNode('*', nf + 5, nf + 4)
+            cgp.out_idx = nf + 6; cgp.update_active_nodes()
+            seeds.append(Individual(cgp))
+
+    # 68. Logistic growth: L / (1 + exp(-k*(x - x0)))
+    if 'sigmoid' in allowed and '*' in allowed and '-' in allowed and 'const' in allowed:
+        for fi in range(min(n_features, 2)):
+            cgp = _make_cgp_base(n_features, feature_names)
+            nf = n_features
+            cgp.nodes[0] = CGPNode('const', 0, 0, random.uniform(-3.0, 3.0))  # midpoint x0
+            cgp.nodes[1] = CGPNode('-', fi, nf)                                 # x - x0
+            cgp.nodes[2] = CGPNode('const', 0, 0, random.uniform(0.5, 5.0))   # steepness k
+            cgp.nodes[3] = CGPNode('*', nf + 2, nf + 1)                        # k*(x-x0)
+            cgp.nodes[4] = CGPNode('sigmoid', nf + 3, 0)                       # σ(k*(x-x0))
+            cgp.nodes[5] = CGPNode('const', 0, 0, random.uniform(1.0, 10.0))  # carrying cap L
+            cgp.nodes[6] = CGPNode('*', nf + 5, nf + 4)
+            cgp.out_idx = nf + 6; cgp.update_active_nodes()
+            seeds.append(Individual(cgp))
+
+    # 69. Lennard-Jones potential: c1/r^12 - c2/r^6  (simplified: c1/r^a - c2/r^b)
+    if 'pow' in allowed and '-' in allowed and '*' in allowed and 'const' in allowed:
+        for fi in range(min(n_features, 2)):
+            cgp = _make_cgp_base(n_features, feature_names)
+            nf = n_features
+            cgp.nodes[0] = CGPNode('const', 0, 0, -6.0)                       # exponent a
+            cgp.nodes[1] = CGPNode('pow', fi, nf)                              # r^(-6)
+            cgp.nodes[2] = CGPNode('const', 0, 0, random.uniform(0.1, 5.0))  # c2
+            cgp.nodes[3] = CGPNode('*', nf + 2, nf + 1)                       # c2 * r^(-6)
+            cgp.nodes[4] = CGPNode('const', 0, 0, -3.0)                       # exponent b (half of a)
+            cgp.nodes[5] = CGPNode('pow', fi, nf + 4)                          # r^(-3)
+            cgp.nodes[6] = CGPNode('const', 0, 0, random.uniform(0.1, 5.0))  # c1
+            cgp.nodes[7] = CGPNode('*', nf + 6, nf + 5)                       # c1 * r^(-3)
+            cgp.nodes[8] = CGPNode('-', nf + 3, nf + 7)                       # c2*r^-6 - c1*r^-3
+            cgp.out_idx = nf + 8; cgp.update_active_nodes()
+            seeds.append(Individual(cgp))
+
+    # 70. Damped oscillation: exp(-a*x) * sin(b*x + c)  — already covered by
+    #     importance-biased seeds but seeding with explicit phase is critical
+    if ('exp' in allowed and 'sin' in allowed and '*' in allowed
+            and '-' in allowed and '+' in allowed and 'const' in allowed):
+        for fi in range(min(n_features, 2)):
+            cgp = _make_cgp_base(n_features, feature_names)
+            nf = n_features
+            cgp.nodes[0]  = CGPNode('const', 0, 0, random.uniform(0.1, 1.0))  # decay a
+            cgp.nodes[1]  = CGPNode('*', nf, fi)                               # a*x
+            cgp.nodes[2]  = CGPNode('neg', nf + 1, 0) if 'neg' in allowed else CGPNode('const', 0, 0, 0.0)
+            if 'neg' in allowed:
+                cgp.nodes[3]  = CGPNode('exp', nf + 2, 0)                      # exp(-a*x)
+            else:
+                cgp.nodes[2] = CGPNode('const', 0, 0, 0.0)
+                cgp.nodes[3] = CGPNode('-', nf + 2, nf + 1)
+                cgp.nodes[3] = CGPNode('exp', nf + 2, 0)  # approximate
+            cgp.nodes[4]  = CGPNode('const', 0, 0, random.uniform(1.0, 6.0))  # freq b
+            cgp.nodes[5]  = CGPNode('*', nf + 4, fi)                           # b*x
+            cgp.nodes[6]  = CGPNode('const', 0, 0, random.uniform(-3.14, 3.14))  # phase c
+            cgp.nodes[7]  = CGPNode('+', nf + 5, nf + 6)                       # b*x + c
+            cgp.nodes[8]  = CGPNode('sin', nf + 7, 0)                          # sin(b*x+c)
+            cgp.nodes[9]  = CGPNode('*', nf + 3, nf + 8)                       # exp(-a*x)*sin(b*x+c)
+            cgp.out_idx = nf + 9; cgp.update_active_nodes()
+            seeds.append(Individual(cgp))
+
+    # 71. Dimensional product: c * x1^a * x2^b  (Buckingham Pi for 2 variables)
+    if n_features >= 2 and 'pow' in allowed and '*' in allowed and 'const' in allowed:
+        for _a, _b in [(2.0, -1.0), (1.0, -2.0), (0.5, 1.5), (-1.0, -1.0),
+                        (1.5, -0.5), (3.0, -1.0), (2.0, 1.0)]:
+            cgp = _make_cgp_base(n_features, feature_names)
+            fi, fj = random.sample(range(n_features), 2)
+            nf = n_features
+            cgp.nodes[0] = CGPNode('const', 0, 0, _a)
+            cgp.nodes[1] = CGPNode('const', 0, 0, _b)
+            cgp.nodes[2] = CGPNode('pow', fi, nf)                              # x1^a
+            cgp.nodes[3] = CGPNode('pow', fj, nf + 1)                          # x2^b
+            cgp.nodes[4] = CGPNode('*', nf + 2, nf + 3)                        # x1^a * x2^b
+            cgp.nodes[5] = CGPNode('const', 0, 0, random.uniform(0.1, 10.0))  # overall scale
+            cgp.nodes[6] = CGPNode('*', nf + 5, nf + 4)
+            cgp.out_idx = nf + 6; cgp.update_active_nodes()
+            seeds.append(Individual(cgp))
+
+    # 72. Sum of inverse squares: c1/x1² + c2/x2²
+    if n_features >= 2 and '/' in allowed and '+' in allowed and 'const' in allowed:
+        cgp = _make_cgp_base(n_features, feature_names)
+        fi, fj = random.sample(range(n_features), 2)
+        nf = n_features
+        cgp.nodes[0] = CGPNode('*', fi, fi)                                    # x1²
+        cgp.nodes[1] = CGPNode('const', 0, 0, random.uniform(0.1, 5.0))
+        cgp.nodes[2] = CGPNode('/', nf + 1, nf)                                # c1/x1²
+        cgp.nodes[3] = CGPNode('*', fj, fj)                                    # x2²
+        cgp.nodes[4] = CGPNode('const', 0, 0, random.uniform(0.1, 5.0))
+        cgp.nodes[5] = CGPNode('/', nf + 4, nf + 3)                            # c2/x2²
+        cgp.nodes[6] = CGPNode('+', nf + 2, nf + 5)
+        cgp.out_idx = nf + 6; cgp.update_active_nodes()
+        seeds.append(Individual(cgp))
+
+    # 73. Stefan-Boltzmann / blackbody: c * x^4
+    if 'pow' in allowed and '*' in allowed and 'const' in allowed:
+        for fi in range(min(n_features, 3)):
+            cgp = _make_cgp_base(n_features, feature_names)
+            nf = n_features
+            cgp.nodes[0] = CGPNode('const', 0, 0, 4.0)
+            cgp.nodes[1] = CGPNode('pow', fi, nf)                              # x^4
+            cgp.nodes[2] = CGPNode('const', 0, 0, random.uniform(0.01, 5.0))
+            cgp.nodes[3] = CGPNode('*', nf + 2, nf + 1)
+            cgp.out_idx = nf + 3; cgp.update_active_nodes()
+            seeds.append(Individual(cgp))
+
+    # 74. Square-root sum (Pythagorean): sqrt(x1² + x2² + x3²)
+    if n_features >= 2 and 'sqrt' in allowed and '+' in allowed:
+        cgp = _make_cgp_base(n_features, feature_names)
+        nf = n_features
+        fs = random.sample(range(n_features), min(n_features, 3))
+        cgp.nodes[0] = CGPNode('*', fs[0], fs[0])
+        if len(fs) >= 2:
+            cgp.nodes[1] = CGPNode('*', fs[1], fs[1])
+            cgp.nodes[2] = CGPNode('+', nf, nf + 1)
+        else:
+            cgp.nodes[1] = CGPNode('const', 0, 0, 0.0)
+            cgp.nodes[2] = CGPNode('+', nf, nf + 1)
+        if len(fs) >= 3:
+            cgp.nodes[3] = CGPNode('*', fs[2], fs[2])
+            cgp.nodes[4] = CGPNode('+', nf + 2, nf + 3)
+            cgp.nodes[5] = CGPNode('sqrt', nf + 4, 0)
+            cgp.out_idx = nf + 5
+        else:
+            cgp.nodes[3] = CGPNode('sqrt', nf + 2, 0)
+            cgp.out_idx = nf + 3
+        cgp.update_active_nodes()
+        seeds.append(Individual(cgp))
+
+    # 75. Reciprocal sum (parallel resistors): 1 / (1/x1 + 1/x2)
+    if n_features >= 2 and '/' in allowed and '+' in allowed and 'const' in allowed:
+        cgp = _make_cgp_base(n_features, feature_names)
+        fi, fj = random.sample(range(n_features), 2)
+        nf = n_features
+        cgp.nodes[0] = CGPNode('const', 0, 0, 1.0)
+        cgp.nodes[1] = CGPNode('/', nf, fi)                                    # 1/x1
+        cgp.nodes[2] = CGPNode('/', nf, fj)                                    # 1/x2
+        cgp.nodes[3] = CGPNode('+', nf + 1, nf + 2)                            # 1/x1 + 1/x2
+        cgp.nodes[4] = CGPNode('/', nf, nf + 3)                                # 1/(1/x1+1/x2)
+        cgp.out_idx = nf + 4; cgp.update_active_nodes()
+        seeds.append(Individual(cgp))
+
+    # 76. Logarithmic ratio: log(x1/x2) = log(x1) - log(x2)  (entropy, information gain)
+    if n_features >= 2 and 'log' in allowed and '-' in allowed:
+        cgp = _make_cgp_base(n_features, feature_names)
+        fi, fj = random.sample(range(n_features), 2)
+        nf = n_features
+        cgp.nodes[0] = CGPNode('log', fi, 0)
+        cgp.nodes[1] = CGPNode('log', fj, 0)
+        cgp.nodes[2] = CGPNode('-', nf, nf + 1)                                # log(x1) - log(x2)
+        cgp.out_idx = nf + 2; cgp.update_active_nodes()
+        seeds.append(Individual(cgp))
+
+    # 77. Polynomial with cross terms: c1*x1² + c2*x1*x2 + c3*x2²  (quadratic form)
+    if n_features >= 2 and '*' in allowed and '+' in allowed and 'const' in allowed:
+        cgp = _make_cgp_base(n_features, feature_names)
+        fi, fj = random.sample(range(n_features), 2)
+        nf = n_features
+        cgp.nodes[0]  = CGPNode('*', fi, fi)                                   # x1²
+        cgp.nodes[1]  = CGPNode('*', fj, fj)                                   # x2²
+        cgp.nodes[2]  = CGPNode('*', fi, fj)                                   # x1*x2
+        cgp.nodes[3]  = CGPNode('const', 0, 0, random.uniform(0.1, 3.0))
+        cgp.nodes[4]  = CGPNode('const', 0, 0, random.uniform(0.1, 3.0))
+        cgp.nodes[5]  = CGPNode('const', 0, 0, random.uniform(0.1, 3.0))
+        cgp.nodes[6]  = CGPNode('*', nf + 3, nf)                               # c1*x1²
+        cgp.nodes[7]  = CGPNode('*', nf + 4, nf + 2)                           # c2*x1*x2
+        cgp.nodes[8]  = CGPNode('*', nf + 5, nf + 1)                           # c3*x2²
+        cgp.nodes[9]  = CGPNode('+', nf + 6, nf + 7)
+        cgp.nodes[10] = CGPNode('+', nf + 9, nf + 8)
+        cgp.out_idx = nf + 10; cgp.update_active_nodes()
+        seeds.append(Individual(cgp))
+
+    # 78. Power law with exp cutoff: c * x^a * exp(-b*x)  (gamma distribution shape)
+    if ('pow' in allowed and 'exp' in allowed and '*' in allowed
+            and 'const' in allowed):
+        for fi in range(min(n_features, 2)):
+            cgp = _make_cgp_base(n_features, feature_names)
+            nf = n_features
+            cgp.nodes[0] = CGPNode('const', 0, 0, random.uniform(0.5, 3.0))   # exponent a
+            cgp.nodes[1] = CGPNode('pow', fi, nf)                              # x^a
+            cgp.nodes[2] = CGPNode('const', 0, 0, random.uniform(0.1, 2.0))   # rate b
+            cgp.nodes[3] = CGPNode('*', nf + 2, fi)                            # b*x
+            cgp.nodes[4] = CGPNode('neg', nf + 3, 0) if 'neg' in allowed else CGPNode('const', 0, 0, 0.0)
+            if 'neg' not in allowed:
+                cgp.nodes[4] = CGPNode('const', 0, 0, 0.0)
+                cgp.nodes[5] = CGPNode('-', nf + 4, nf + 3)                    # -b*x
+                cgp.nodes[6] = CGPNode('exp', nf + 5, 0)                       # exp(-b*x)
+            else:
+                cgp.nodes[5] = CGPNode('exp', nf + 4, 0)                       # exp(-b*x)
+                cgp.nodes[6] = CGPNode('const', 0, 0, 0.0)                     # placeholder
+            exp_node = nf + 6 if 'neg' not in allowed else nf + 5
+            cgp.nodes[7] = CGPNode('*', nf + 1, exp_node)                      # x^a * exp(-b*x)
+            cgp.nodes[8] = CGPNode('const', 0, 0, random.uniform(0.5, 5.0))
+            cgp.nodes[9] = CGPNode('*', nf + 8, nf + 7)                        # c * ...
+            cgp.out_idx = nf + 9; cgp.update_active_nodes()
+            seeds.append(Individual(cgp))
+
+    # 79. Kepler's 3rd law style: x1^a / x2^b  (period-radius relation)
+    if n_features >= 2 and 'pow' in allowed and '/' in allowed and 'const' in allowed:
+        for _a, _b in [(1.5, 1.0), (2.0, 3.0), (3.0, 2.0), (0.5, 1.0)]:
+            cgp = _make_cgp_base(n_features, feature_names)
+            fi, fj = random.sample(range(n_features), 2)
+            nf = n_features
+            cgp.nodes[0] = CGPNode('const', 0, 0, _a)
+            cgp.nodes[1] = CGPNode('pow', fi, nf)                              # x1^a
+            cgp.nodes[2] = CGPNode('const', 0, 0, _b)
+            cgp.nodes[3] = CGPNode('pow', fj, nf + 2)                          # x2^b
+            cgp.nodes[4] = CGPNode('/', nf + 1, nf + 3)                        # x1^a / x2^b
+            cgp.nodes[5] = CGPNode('const', 0, 0, random.uniform(0.1, 10.0))
+            cgp.nodes[6] = CGPNode('*', nf + 5, nf + 4)
+            cgp.out_idx = nf + 6; cgp.update_active_nodes()
+            seeds.append(Individual(cgp))
+
     # ── IF/ELSE seed templates ─────────────────────────────────────────────
     if 'if_else' in allowed:
         nf = n_features
-        # 63. Step function: IF(x > c) THEN 1 ELSE 0
+        # 80. Step function: IF(x > c) THEN 1 ELSE 0
         if 'gt' in allowed and 'const' in allowed:
             cgp = _make_cgp_base(n_features, feature_names)
             f = feat()
@@ -4607,6 +4903,82 @@ def generate_seeds_v5(n_features, feature_names):
             cgp.nodes[0] = CGPNode('gt', fi, fj)
             cgp.nodes[1] = CGPNode('if_else', nf, fi, 0.0, in3=fj)
             cgp.out_idx = nf + 1; cgp.update_active_nodes()
+            seeds.append(Individual(cgp))
+
+        # 83. Clamp / clip: IF(x > c_hi) THEN c_hi ELSE IF(x < c_lo) THEN c_lo ELSE x
+        if 'gt' in allowed and 'lt' in allowed and 'const' in allowed:
+            f = feat()
+            cgp = _make_cgp_base(n_features, feature_names)
+            cgp.nodes[0] = CGPNode('const', 0, 0, random.uniform(1.0, 5.0))  # c_hi
+            cgp.nodes[1] = CGPNode('gt', f, nf)                               # x > c_hi?
+            cgp.nodes[2] = CGPNode('const', 0, 0, random.uniform(-5.0, -1.0)) # c_lo
+            cgp.nodes[3] = CGPNode('lt', f, nf + 2)                           # x < c_lo?
+            cgp.nodes[4] = CGPNode('if_else', nf + 3, nf + 2, 0.0, in3=f)    # inner: lo or x
+            cgp.nodes[5] = CGPNode('if_else', nf + 1, nf, 0.0, in3=nf + 4)   # outer: hi or inner
+            cgp.out_idx = nf + 5; cgp.update_active_nodes()
+            seeds.append(Individual(cgp))
+
+        # 84. Absolute value via if-else: IF(x > 0) THEN x ELSE -x
+        if 'gt' in allowed and 'const' in allowed and ('neg' in allowed or '-' in allowed):
+            f = feat()
+            cgp = _make_cgp_base(n_features, feature_names)
+            cgp.nodes[0] = CGPNode('const', 0, 0, 0.0)
+            cgp.nodes[1] = CGPNode('gt', f, nf)                               # x > 0?
+            if 'neg' in allowed:
+                cgp.nodes[2] = CGPNode('neg', f, 0)                           # -x
+            else:
+                cgp.nodes[2] = CGPNode('-', nf, f)                             # 0 - x
+            cgp.nodes[3] = CGPNode('if_else', nf + 1, f, 0.0, in3=nf + 2)
+            cgp.out_idx = nf + 3; cgp.update_active_nodes()
+            seeds.append(Individual(cgp))
+
+        # 85. Piecewise constant: IF(x > c1) THEN a ELSE IF(x > c2) THEN b ELSE c
+        if 'gt' in allowed and 'const' in allowed:
+            f = feat()
+            cgp = _make_cgp_base(n_features, feature_names)
+            cgp.nodes[0] = CGPNode('const', 0, 0, random.uniform(-2.0, 0.0))  # c2 (lower threshold)
+            cgp.nodes[1] = CGPNode('gt', f, nf)                                # x > c2?
+            cgp.nodes[2] = CGPNode('const', 0, 0, random.uniform(-1.0, 1.0))  # b (middle value)
+            cgp.nodes[3] = CGPNode('const', 0, 0, random.uniform(-3.0, -1.0)) # c (low value)
+            cgp.nodes[4] = CGPNode('if_else', nf + 1, nf + 2, 0.0, in3=nf + 3)  # inner
+            cgp.nodes[5] = CGPNode('const', 0, 0, random.uniform(0.0, 2.0))   # c1 (upper threshold)
+            cgp.nodes[6] = CGPNode('gt', f, nf + 5)                            # x > c1?
+            cgp.nodes[7] = CGPNode('const', 0, 0, random.uniform(1.0, 3.0))   # a (high value)
+            cgp.nodes[8] = CGPNode('if_else', nf + 6, nf + 7, 0.0, in3=nf + 4)
+            cgp.out_idx = nf + 8; cgp.update_active_nodes()
+            seeds.append(Individual(cgp))
+
+        # 86. Piecewise polynomial: IF(x > c) THEN c1*x + c2 ELSE c3*x² + c4
+        if 'gt' in allowed and '*' in allowed and '+' in allowed and 'const' in allowed:
+            f = feat()
+            cgp = _make_cgp_base(n_features, feature_names)
+            cgp.nodes[0]  = CGPNode('const', 0, 0, random.uniform(-1.0, 1.0))  # threshold
+            cgp.nodes[1]  = CGPNode('gt', f, nf)
+            cgp.nodes[2]  = CGPNode('const', 0, 0, random.uniform(0.5, 3.0))   # c1
+            cgp.nodes[3]  = CGPNode('*', nf + 2, f)                             # c1*x
+            cgp.nodes[4]  = CGPNode('const', 0, 0, random.uniform(-2.0, 2.0))  # c2
+            cgp.nodes[5]  = CGPNode('+', nf + 3, nf + 4)                        # c1*x + c2
+            cgp.nodes[6]  = CGPNode('*', f, f)                                  # x²
+            cgp.nodes[7]  = CGPNode('const', 0, 0, random.uniform(0.1, 2.0))   # c3
+            cgp.nodes[8]  = CGPNode('*', nf + 7, nf + 6)                        # c3*x²
+            cgp.nodes[9]  = CGPNode('const', 0, 0, random.uniform(-2.0, 2.0))  # c4
+            cgp.nodes[10] = CGPNode('+', nf + 8, nf + 9)                        # c3*x² + c4
+            cgp.nodes[11] = CGPNode('if_else', nf + 1, nf + 5, 0.0, in3=nf + 10)
+            cgp.out_idx = nf + 11; cgp.update_active_nodes()
+            seeds.append(Individual(cgp))
+
+        # 87. Two-feature conditional: IF(x1 > c) THEN f(x2) ELSE g(x2)
+        if n_features >= 2 and 'gt' in allowed and 'const' in allowed and '*' in allowed:
+            fi, fj = random.sample(range(n_features), 2)
+            cgp = _make_cgp_base(n_features, feature_names)
+            cgp.nodes[0] = CGPNode('const', 0, 0, random.uniform(-2.0, 2.0))
+            cgp.nodes[1] = CGPNode('gt', fi, nf)                               # x1 > c?
+            cgp.nodes[2] = CGPNode('const', 0, 0, random.uniform(0.5, 3.0))
+            cgp.nodes[3] = CGPNode('*', nf + 2, fj)                            # c1*x2
+            cgp.nodes[4] = CGPNode('const', 0, 0, random.uniform(-3.0, -0.5))
+            cgp.nodes[5] = CGPNode('*', nf + 4, fj)                            # c2*x2
+            cgp.nodes[6] = CGPNode('if_else', nf + 1, nf + 3, 0.0, in3=nf + 5)
+            cgp.out_idx = nf + 6; cgp.update_active_nodes()
             seeds.append(Individual(cgp))
 
     return seeds
@@ -5067,15 +5439,27 @@ def macro_prune(cgp_eq, n_features):
                 n = stack.pop()
                 if n in visited or n < n_features: continue
                 visited.add(n); seen += 1
+                if n - n_features >= len(eq.nodes):
+                    continue
                 node = eq.nodes[n - n_features]
                 if node.op != 'const':
                     stack.append(node.in1)
                     if node.op in eq.OPS_BINARY_SET:
                         stack.append(node.in2)
+                    elif node.op in eq.OPS_TERNARY_SET:
+                        stack.append(node.in2)
+                        stack.append(node.in3)
             return seen
         d1 = _descendant_count(child, target_node.in1)
         d2 = _descendant_count(child, target_node.in2)
-        replacement = target_node.in1 if d1 >= d2 else target_node.in2
+        if target_node.op in child.OPS_TERNARY_SET:
+            # For ternary (if_else): prefer the true or false branch (in2/in3)
+            # over the condition (in1), as branches carry more semantic content
+            d3 = _descendant_count(child, target_node.in3)
+            candidates = [(d2, target_node.in2), (d3, target_node.in3), (d1, target_node.in1)]
+            replacement = max(candidates, key=lambda x: x[0])[1]
+        else:
+            replacement = target_node.in1 if d1 >= d2 else target_node.in2
     else:
         replacement = target_node.in1
 
@@ -5464,7 +5848,7 @@ class Individual:
         return preds
 
     def boost_on_residuals(self, X, y_target, type_code, n_features, feat_names,
-                           max_boost_gens=50, boost_lr=0.3):
+                           max_boost_gens=80, boost_lr=0.3):
         """
         Intra-individual gradient boosting: evolve a small correction tree on the
         residuals left by the current prediction (main tree + existing boosts).
@@ -5473,8 +5857,14 @@ class Individual:
         data patterns — the correction term patches those gaps without changing
         the main tree's structure.
 
-        Only applies to regression (type_code != 6) and only if the individual
-        has not reached its boost stage cap.
+        Improvements over the original version:
+          - Larger mini-population (25) with residual-aware seeding
+          - Crossover between correction candidates (not just mutation)
+          - Adaptive learning rate via line search on the full residual
+          - Lower R² acceptance threshold (0.005) — even tiny corrections
+            compound across multiple boost stages
+          - Weighted sampling: harder residual regions get more attention
+          - Multiple const-opt restarts on the best correction
         """
         if type_code == 6:
             return  # skip for classification
@@ -5490,37 +5880,94 @@ class Individual:
         if res_var < 1e-10:
             return  # already near-perfect
 
-        # Mini-evolution: small population, short run, targeting residuals
-        MINI_POP = 15
-        MINI_NODES = max(10, CGP_NODES // 3)  # smaller graphs for corrections
+        # Mini-evolution: moderate population, targeting residuals
+        MINI_POP = 25
+        MINI_NODES = max(12, CGP_NODES // 3)  # smaller graphs for corrections
 
         mini_pop = []
-        for _ in range(MINI_POP):
+
+        # Seed with residual-aware seeds: analyze which features correlate
+        # with the residual pattern and create targeted initial individuals
+        try:
+            for fi in range(min(n_features, 5)):
+                xi = X[:, fi]
+                if np.std(xi) < 1e-10:
+                    continue
+                r = abs(float(np.corrcoef(xi, residuals)[0, 1]))
+                if np.isnan(r) or r < 0.1:
+                    continue
+                # Linear seed on correlated feature
+                cgp = _make_cgp_base(n_features, feat_names, max_nodes=MINI_NODES)
+                nf = n_features
+                slope = float(np.cov(xi, residuals)[0, 1] / (np.var(xi) + 1e-30))
+                cgp.nodes[0] = CGPNode('const', 0, 0, slope)
+                cgp.nodes[1] = CGPNode('*', nf, fi)
+                cgp.out_idx = nf + 1; cgp.update_active_nodes()
+                ind = Individual(cgp)
+                ind.boost_stages = []; ind.boost_max_stages = 0
+                mini_pop.append(ind)
+                # Nonlinear seed: try x² of this feature
+                if 'square' in ALLOWED_OPS:
+                    cgp2 = _make_cgp_base(n_features, feat_names, max_nodes=MINI_NODES)
+                    cgp2.nodes[0] = CGPNode('square', fi, 0)
+                    cgp2.out_idx = nf; cgp2.update_active_nodes()
+                    ind2 = Individual(cgp2)
+                    ind2.boost_stages = []; ind2.boost_max_stages = 0
+                    mini_pop.append(ind2)
+        except Exception:
+            pass
+
+        # Fill remaining slots with random individuals
+        while len(mini_pop) < MINI_POP:
             cgp = random_cgp(n_features, MINI_NODES, feat_names)
             ind = Individual(cgp)
-            ind.boost_stages = []  # corrections don't have sub-corrections
+            ind.boost_stages = []
             ind.boost_max_stages = 0
             mini_pop.append(ind)
 
+        # Compute per-sample weights proportional to |residual| — focus on
+        # high-error regions (important for gradient boosting convergence)
+        abs_res = np.abs(residuals)
+        sample_weights = abs_res / (np.mean(abs_res) + 1e-30)
+        sample_weights = np.clip(sample_weights, 0.1, 10.0)
+
         # Evaluate on residuals
         for ind in mini_pop:
-            ind.calculate_fitness(X, residuals, 5)  # regression on residuals
+            ind.calculate_fitness(X, residuals, 5, sample_weights=sample_weights)
 
         best = min(mini_pop, key=lambda x: x.loss)
 
-        # Simple evolutionary loop
-        for _ in range(max_boost_gens):
-            parent = min(random.sample(mini_pop, min(3, len(mini_pop))),
+        # Evolutionary loop with crossover support
+        stagnation = 0
+        prev_best_loss = best.loss
+        for gen_i in range(max_boost_gens):
+            # Tournament selection
+            parent = min(random.sample(mini_pop, min(4, len(mini_pop))),
                          key=lambda x: x.fitness)
-            child_tree = mutate(parent.tree, n_features, feat_names,
-                                mut_rate=max(1, CGP_MUT_RATE))
+
+            # 20% crossover, 80% mutation
+            if random.random() < 0.20 and len(mini_pop) >= 2:
+                parent2 = min(random.sample(mini_pop, min(3, len(mini_pop))),
+                              key=lambda x: x.fitness)
+                child_tree = crossover(parent.tree, parent2.tree)
+                child_tree = mutate(child_tree, n_features, feat_names,
+                                    mut_rate=max(1, CGP_MUT_RATE // 2))
+            else:
+                # Increase mutation rate when stagnating
+                rate = max(1, CGP_MUT_RATE * (2 if stagnation > 15 else 1))
+                child_tree = mutate(parent.tree, n_features, feat_names,
+                                    mut_rate=rate)
+
             child = Individual(child_tree)
             child.boost_stages = []
             child.boost_max_stages = 0
-            child.calculate_fitness(X, residuals, 5)
+            child.calculate_fitness(X, residuals, 5, sample_weights=sample_weights)
 
             if child.loss < best.loss:
                 best = child
+                stagnation = 0
+            else:
+                stagnation += 1
 
             # Replace worst
             worst = max(mini_pop, key=lambda x: x.fitness)
@@ -5528,31 +5975,60 @@ class Individual:
                 mini_pop.remove(worst)
                 mini_pop.append(child)
 
-        # Check if the correction actually helps
-        if best.loss >= 1e9 or best.r2 < 0.01:
+            # If stagnating badly, inject fresh blood
+            if stagnation > 25 and gen_i < max_boost_gens - 10:
+                fresh = Individual(random_cgp(n_features, MINI_NODES, feat_names))
+                fresh.boost_stages = []; fresh.boost_max_stages = 0
+                fresh.calculate_fitness(X, residuals, 5, sample_weights=sample_weights)
+                worst = max(mini_pop, key=lambda x: x.fitness)
+                mini_pop.remove(worst); mini_pop.append(fresh)
+                stagnation = 0
+
+        # Check if the correction actually helps (lower threshold than before)
+        if best.loss >= 1e9 or best.r2 < 0.005:
             return  # correction is useless
 
-        # Quick const-opt on the correction
+        # More thorough const-opt on the correction
         if get_constants_shared(best.tree):
             best.optimize_constants(X, residuals, 5,
-                                    max_rows=min(500, X.shape[0]),
-                                    n_restarts=1, max_iter=30)
+                                    max_rows=min(800, X.shape[0]),
+                                    n_restarts=2, max_iter=50)
 
-        # Verify the correction reduces total error
+        # Line-search for optimal learning rate instead of fixed boost_lr
         corr_preds = best.tree.evaluate(X)
         corr_preds = np.clip(np.nan_to_num(corr_preds, nan=0.0, posinf=1e9,
                                             neginf=-1e9), -1e9, 1e9)
-        corr_scaled = boost_lr * (best.affine_a * corr_preds + best.affine_b)
-        new_preds = preds + corr_scaled
-        new_mse = float(np.mean((y_target - new_preds) ** 2))
-        old_mse = float(np.mean(residuals ** 2))
+        corr_scaled_unit = best.affine_a * corr_preds + best.affine_b
 
-        if new_mse < old_mse * 0.95:  # at least 5% improvement
+        # Grid search for optimal lr
+        best_lr = boost_lr
+        best_mse = float('inf')
+        old_mse = float(np.mean(residuals ** 2))
+        for candidate_lr in [0.05, 0.1, 0.15, 0.2, 0.3, 0.5, 0.7, 1.0]:
+            trial_preds = preds + candidate_lr * corr_scaled_unit
+            trial_mse = float(np.mean((y_target - trial_preds) ** 2))
+            if trial_mse < best_mse:
+                best_mse = trial_mse
+                best_lr = candidate_lr
+
+        # Also try Newton step: lr* = <residuals, h> / <h, h>
+        h = corr_scaled_unit
+        h_dot_h = float(np.dot(h, h))
+        if h_dot_h > 1e-10:
+            newton_lr = float(np.dot(residuals, h)) / h_dot_h
+            newton_lr = np.clip(newton_lr, 0.01, 2.0)
+            trial_preds = preds + newton_lr * corr_scaled_unit
+            trial_mse = float(np.mean((y_target - trial_preds) ** 2))
+            if trial_mse < best_mse:
+                best_mse = trial_mse
+                best_lr = newton_lr
+
+        if best_mse < old_mse * 0.98:  # at least 2% improvement (was 5%)
             self.boost_stages.append((
                 copy.deepcopy(best.tree),
                 best.affine_a,
                 best.affine_b,
-                boost_lr
+                best_lr
             ))
             # Update complexity to account for the correction
             self.complexity += best.tree.get_complexity() * 0.5  # discounted
@@ -7248,6 +7724,83 @@ def macro_trig_identity(cgp_eq, n_features):
     return child
 
 
+def macro_piecewise(cgp_eq, n_features, feature_names):
+    """
+    Piecewise / if-else macro-mutation: wraps the current output in a
+    conditional split, creating a piecewise expression.
+
+    Strategies (chosen randomly):
+      1. Threshold split: IF(x_i > c) THEN current_output ELSE c2
+         — Creates a region where the expression "turns off" below a threshold.
+      2. Feature gate: IF(x_i > c) THEN current_output ELSE alternative_expr
+         — Replaces the output with a different feature/const in one region.
+      3. Blend: IF(x_i > x_j) THEN current_output ELSE x_j
+         — Switches between the evolved expression and a raw feature.
+
+    Only active when IF_ELSE_ENABLED is True and if_else is in the op set.
+    """
+    if not IF_ELSE_ENABLED or 'if_else' not in CGPEquation.OPS_TERNARY_SET:
+        return copy.deepcopy(cgp_eq)
+
+    child = copy.deepcopy(cgp_eq)
+    child.update_active_nodes()
+
+    active = sorted(i for i in child.active_nodes if i >= n_features)
+    max_active = max(active) if active else (n_features - 1)
+    all_slots = range(n_features, n_features + child.max_nodes)
+    free_slots = [s for s in all_slots
+                  if s not in child.active_nodes and s > max_active]
+
+    # Need at least 3 free slots: comparison/const, condition, if_else node
+    if len(free_slots) < 3:
+        return child
+
+    comp_ops = [op for op in ['gt', 'lt'] if op in CGPEquation.OPS_BINARY_SET]
+    if not comp_ops:
+        return child
+
+    strategy = random.random()
+    cur_out = child.out_idx
+    feat_idx = random.randint(0, n_features - 1)
+
+    if strategy < 0.4 and 'const' in ALLOWED_OPS:
+        # Strategy 1: Threshold split — IF(x > c) THEN expr ELSE const
+        s1, s2, s3 = free_slots[0], free_slots[1], free_slots[2]
+        child.nodes[s1 - n_features] = CGPNode('const', 0, 0, random.gauss(0, 2.0))
+        child.nodes[s2 - n_features] = CGPNode(random.choice(comp_ops), feat_idx, s1)
+        # False branch: a learnable constant
+        if len(free_slots) >= 4:
+            s4 = free_slots[3]
+            child.nodes[s4 - n_features] = CGPNode('const', 0, 0, random.gauss(0, 1.0))
+            child.nodes[s3 - n_features] = CGPNode('if_else', s2, cur_out, 0.0, in3=s4)
+        else:
+            child.nodes[s3 - n_features] = CGPNode('if_else', s2, cur_out, 0.0, in3=s1)
+        child.out_idx = s3
+    elif strategy < 0.7 and n_features >= 2:
+        # Strategy 2: Feature gate — IF(x_i > x_j) THEN expr ELSE x_j
+        s1, s2 = free_slots[0], free_slots[1]
+        feat2 = random.choice([f for f in range(n_features) if f != feat_idx])
+        child.nodes[s1 - n_features] = CGPNode(random.choice(comp_ops), feat_idx, feat2)
+        child.nodes[s2 - n_features] = CGPNode('if_else', s1, cur_out, 0.0, in3=feat2)
+        child.out_idx = s2
+    else:
+        # Strategy 3: Region blend with constant threshold
+        if 'const' in ALLOWED_OPS and len(free_slots) >= 4:
+            s1, s2, s3, s4 = free_slots[0], free_slots[1], free_slots[2], free_slots[3]
+            child.nodes[s1 - n_features] = CGPNode('const', 0, 0, random.gauss(0, 2.0))
+            child.nodes[s2 - n_features] = CGPNode(random.choice(comp_ops), feat_idx, s1)
+            # False branch: use a different feature or feature * const
+            alt_feat = random.randint(0, n_features - 1)
+            child.nodes[s3 - n_features] = CGPNode('const', 0, 0, random.uniform(0.5, 3.0))
+            child.nodes[s4 - n_features] = CGPNode('if_else', s2, cur_out, 0.0, in3=alt_feat)
+            child.out_idx = s4
+        else:
+            return child
+
+    child.update_active_nodes()
+    return child
+
+
 def _create_offspring(action, parent, population, n_features, feat_names,
                       eff_rate, sa_temp, parent_sigma, X,
                       op_affinity=None, y_residuals=None):
@@ -7304,6 +7857,8 @@ def _create_offspring(action, parent, population, n_features, feat_names,
         child_tree = macro_trig_identity(parent.tree, n_features)
     elif action == 'ablate':
         child_tree = macro_ablate_feature(parent.tree, n_features)
+    elif action == 'piecewise':
+        child_tree = macro_piecewise(parent.tree, n_features, feat_names)
     else:  # mutate
         child_tree = mutate(parent.tree, n_features, feat_names,
                             mut_rate=eff_rate, temperature=sa_temp,
@@ -7369,8 +7924,8 @@ def evolve_island_chunk(args):
 
     # ── IMPROVEMENT: Adaptive reproductive operator tracker ────────────────
     # Tracks which operators produce accepted children; adapts weights over time.
-    _repro_ops_base = ['mutate', 'crossover', 'semantic_xover', 'grow', 'prune', 'graft', 'optimize', 'boost', 'do_nothing', 'div', 'trig', 'ablate']
-    _repro_weights_base = [4.0, 1.0, 0.8, 0.5, 0.5, 0.5, 1.5, 0.6, 0.5, 0.5, 0.8, 0.3]
+    _repro_ops_base = ['mutate', 'crossover', 'semantic_xover', 'grow', 'prune', 'graft', 'optimize', 'boost', 'do_nothing', 'div', 'trig', 'ablate', 'piecewise']
+    _repro_weights_base = [4.0, 1.0, 0.8, 0.5, 0.5, 0.5, 1.5, 0.6, 0.5, 0.5, 0.8, 0.3, 0.6 if IF_ELSE_ENABLED else 0.0]
     _mut_tracker = AdaptiveMutationTracker(_repro_ops_base, _repro_weights_base, alpha=0.07)
 
     # ── IMPROVEMENT: Operator affinity (updated every 200 gens) ───────────
@@ -7919,8 +8474,8 @@ def evolve_afpo(population, X, y_target, type_code,
 
     # ── Adaptive reproductive operator tracker (same as island model) ─────
     _repro_ops_base = ['mutate', 'crossover', 'semantic_xover', 'grow', 'prune', 'graft',
-                       'optimize', 'boost', 'do_nothing', 'div', 'trig', 'ablate']
-    _repro_weights_base = [4.0, 1.0, 0.8, 0.5, 0.5, 0.5, 1.5, 0.6, 0.5, 0.5, 0.8, 0.3]
+                       'optimize', 'boost', 'do_nothing', 'div', 'trig', 'ablate', 'piecewise']
+    _repro_weights_base = [4.0, 1.0, 0.8, 0.5, 0.5, 0.5, 1.5, 0.6, 0.5, 0.5, 0.8, 0.3, 0.6 if IF_ELSE_ENABLED else 0.0]
     _mut_tracker = AdaptiveMutationTracker(_repro_ops_base, _repro_weights_base, alpha=0.07)
 
     local_stag = stag_counter
@@ -8770,8 +9325,10 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
                 n_macro = int(BAYESIAN_N_CANDIDATES * 0.10)
                 for _ in range(n_macro):
                     parent = random.choice(top_inds)
-                    macro_choice = random.choice(['grow', 'prune', 'graft',
-                                                   'rational', 'trig'])
+                    _macro_choices = ['grow', 'prune', 'graft', 'rational', 'trig']
+                    if IF_ELSE_ENABLED:
+                        _macro_choices.append('piecewise')
+                    macro_choice = random.choice(_macro_choices)
                     if macro_choice == 'grow':
                         ct = macro_grow(parent.tree, n_features, feat_names)
                     elif macro_choice == 'prune':
@@ -8780,6 +9337,8 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
                         ct = macro_graft_feature(parent.tree, n_features, feat_names)
                     elif macro_choice == 'rational':
                         ct = macro_rational_grow(parent.tree, n_features)
+                    elif macro_choice == 'piecewise':
+                        ct = macro_piecewise(parent.tree, n_features, feat_names)
                     else:
                         ct = macro_trig_identity(parent.tree, n_features)
                     candidate_trees.append(ct)
@@ -9188,6 +9747,32 @@ def _run_boosting_stage_evolution(X, residuals, n_features, feat_names,
             imp_seeds = generate_importance_biased_seeds(
                 n_features, feat_names, X_stage, res_stage)
             pop.extend(imp_seeds)
+        except Exception:
+            pass
+
+        # Residual-correlated seeds: for each feature that correlates with
+        # the residuals, inject a targeted linear seed.  This dramatically
+        # accelerates boosting convergence on structured residual patterns.
+        try:
+            for fi in range(min(n_features, 8)):
+                xi = X_stage[:, fi]
+                if np.std(xi) < 1e-10:
+                    continue
+                r_corr = abs(float(np.corrcoef(xi, res_stage)[0, 1]))
+                if np.isnan(r_corr) or r_corr < 0.1:
+                    continue
+                # Linear seed: slope * feature
+                xi_var = float(np.var(xi))
+                if xi_var > 1e-10:
+                    slope = float(np.cov(xi, res_stage)[0, 1] / xi_var)
+                else:
+                    slope = 1.0
+                cgp = _make_cgp_base(n_features, feat_names)
+                nf = n_features
+                cgp.nodes[0] = CGPNode('const', 0, 0, slope)
+                cgp.nodes[1] = CGPNode('*', nf, fi)
+                cgp.out_idx = nf + 1; cgp.update_active_nodes()
+                pop.append(Individual(cgp))
         except Exception:
             pass
 
