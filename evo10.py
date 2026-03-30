@@ -3179,35 +3179,105 @@ class HallOfFame:
 # ==========================================
 
 def random_cgp(n_features, max_nodes, feature_names):
+    """Generate a random CGP individual.
+
+    50% of the time uses "structured random" generation that builds a coherent
+    expression tree from the bottom up (ensuring meaningful active graphs),
+    and 50% uses the traditional fully-random approach (preserving diversity).
+
+    The structured approach solves the problem where random CGP individuals
+    have tiny or degenerate active graphs that contribute nothing useful to
+    the population.
+    """
     eq = CGPEquation(n_features, max_nodes, feature_names)
-    for i in range(max_nodes):
-        max_connect = max(0, n_features + i - 1)
-        op = random.choice(CGPEquation.OPS_ALL)
-        in1 = random.randint(0, max_connect)
-        in2 = random.randint(0, max_connect)
-        in3 = random.randint(0, max_connect)  # for ternary ops (if_else)
-        
-        # Improved constant distribution:
-        # Mix of random Gaussian, common math/physics constants, and
-        # magnitude-scaled values to cover a wider range faster.
+
+    def _random_const():
         roll = random.random()
         if roll < 0.15:
-            # Common useful constants
-            c_val = random.choice([0.0, 1.0, -1.0, 2.0, -2.0, 0.5, -0.5,
+            return random.choice([0.0, 1.0, -1.0, 2.0, -2.0, 0.5, -0.5,
                                     np.pi, 2*np.pi, np.e, 10.0, 100.0,
                                     60.0, 3600.0, 0.01, 0.1,
                                     np.sqrt(2), np.log(2), np.log(10)])
         elif roll < 0.4:
-            # Small integers and simple fractions
-            c_val = random.choice([-5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5,
+            return random.choice([-5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5,
                                     0.25, 0.33, 0.5, 0.67, 0.75, 1.5, 2.5, 3.5])
         else:
-            # Random with magnitude scaling
             mag = random.choice([0.1, 1.0, 10.0, 100.0, 1000.0])
-            c_val = random.gauss(0, 2.0) * mag
-        
-        eq.nodes.append(CGPNode(op, in1, in2, c_val, in3=in3))
-    eq.out_idx = random.randint(0, n_features + max_nodes - 1)
+            return random.gauss(0, 2.0) * mag
+
+    use_structured = random.random() < 0.50
+
+    if use_structured:
+        # --- Structured random: build a tree bottom-up ---
+        # Target depth 2-5 nodes of active computation, ensuring every node
+        # contributes to the output.  This produces individuals with meaningful
+        # active graphs instead of the typical 1-2 node junk.
+        target_depth = random.randint(2, min(6, max_nodes // 2))
+
+        # Fill all nodes with random junk first (for neutral drift)
+        for i in range(max_nodes):
+            max_connect = max(0, n_features + i - 1)
+            op = random.choice(CGPEquation.OPS_ALL)
+            in1 = random.randint(0, max_connect)
+            in2 = random.randint(0, max_connect)
+            in3 = random.randint(0, max_connect)
+            eq.nodes.append(CGPNode(op, in1, in2, _random_const(), in3=in3))
+
+        # Now build a coherent chain in the first `target_depth` slots.
+        # Layer 0: operate on raw features
+        # Layer k: operate on layer k-1 outputs + features
+        layer_outputs = list(range(n_features))  # start with raw features
+
+        for layer in range(target_depth):
+            slot = layer
+            if slot >= max_nodes:
+                break
+            max_connect = max(0, n_features + slot - 1)
+
+            # Decide: unary (wrap previous) vs binary (combine two things)
+            unary_ops  = CGPEquation.OPS_UNARY or []
+            binary_ops = CGPEquation.OPS_BINARY or []
+
+            # Bias toward operations that reference previous layer outputs
+            if binary_ops and (len(layer_outputs) >= 2 or random.random() < 0.4):
+                op = random.choice(binary_ops)
+                in1 = random.choice(layer_outputs)
+                # For binary: sometimes pick a feature, sometimes a layer output
+                if random.random() < 0.5 and n_features > 0:
+                    in2 = random.randint(0, n_features - 1)
+                else:
+                    in2 = random.choice(layer_outputs)
+                # Clamp to valid range
+                in1 = min(in1, max_connect)
+                in2 = min(in2, max_connect)
+                eq.nodes[slot] = CGPNode(op, in1, in2, _random_const())
+            elif unary_ops:
+                op = random.choice(unary_ops)
+                in1 = random.choice(layer_outputs)
+                in1 = min(in1, max_connect)
+                eq.nodes[slot] = CGPNode(op, in1, 0, _random_const())
+            else:
+                # Only const available
+                eq.nodes[slot] = CGPNode('const', 0, 0, _random_const())
+
+            layer_outputs.append(n_features + slot)
+            # Keep the pool bounded to avoid always referencing distant nodes
+            if len(layer_outputs) > 6:
+                layer_outputs = layer_outputs[-4:] + list(range(min(n_features, 3)))
+
+        # Point output at the last structured node
+        eq.out_idx = n_features + min(target_depth - 1, max_nodes - 1)
+    else:
+        # --- Traditional fully-random CGP ---
+        for i in range(max_nodes):
+            max_connect = max(0, n_features + i - 1)
+            op = random.choice(CGPEquation.OPS_ALL)
+            in1 = random.randint(0, max_connect)
+            in2 = random.randint(0, max_connect)
+            in3 = random.randint(0, max_connect)
+            eq.nodes.append(CGPNode(op, in1, in2, _random_const(), in3=in3))
+        eq.out_idx = random.randint(0, n_features + max_nodes - 1)
+
     eq.update_active_nodes()
     return eq
 
@@ -4986,10 +5056,61 @@ def generate_seeds_v5(n_features, feature_names):
 
 
 
+def _build_random_mini_tree(child_eq, n_features, start_slot, max_depth=3,
+                            available_inputs=None):
+    """Build a small coherent random expression tree in consecutive CGP slots.
+
+    Returns the slot index of the root node, or None if no space.
+    *available_inputs* are the slot indices that can be referenced (features +
+    any active compute nodes below start_slot).
+    """
+    if available_inputs is None:
+        available_inputs = list(range(n_features))
+
+    unary_ops  = CGPEquation.OPS_UNARY  or []
+    binary_ops = CGPEquation.OPS_BINARY or []
+    all_ops    = unary_ops + binary_ops
+    if not all_ops:
+        return None
+
+    max_slot = n_features + child_eq.max_nodes
+    slots_used = []
+    cur = start_slot
+
+    def _pick_input():
+        pool = list(available_inputs) + [n_features + s for s in slots_used]
+        return random.choice(pool) if pool else random.randint(0, n_features - 1)
+
+    for depth in range(max_depth):
+        if n_features + cur >= max_slot:
+            break
+        # Leaf vs internal decision: deeper = more likely to stop
+        if depth > 0 and random.random() < 0.35:
+            break
+        op = random.choice(all_ops)
+        in1 = _pick_input()
+        in2 = _pick_input() if op in CGPEquation.OPS_BINARY_SET else 0
+        # For const nodes inject a useful constant value
+        if op == 'const':
+            c_val = random.choice([0.5, 1.0, 2.0, 3.0, -1.0, np.pi,
+                                    0.1, 10.0, -0.5, np.e])
+        else:
+            c_val = random.gauss(0, 2.0)
+        child_eq.nodes[cur] = CGPNode(op, in1, in2, c_val)
+        slots_used.append(cur)
+        cur += 1
+
+    return (n_features + slots_used[-1]) if slots_used else None
+
+
 def mutate(parent_eq, n_features, feature_names, mut_rate=None, temperature=0.0,
            op_affinity: dict | None = None):
     """
     Point-mutation of a CGP equation.
+
+    Includes structural mutations (compose, decompose, inject_subtree) alongside
+    traditional constant-tuning and rewiring, giving the search the ability to
+    discover novel expression structures — not just optimize constants.
 
     op_affinity : optional dict mapping op_name → float weight (0,1].
                   When provided, operator selection inside 'operator' mutations
@@ -5007,39 +5128,57 @@ def mutate(parent_eq, n_features, feature_names, mut_rate=None, temperature=0.0,
     all_compute      = set(range(child_eq.max_nodes))
     inactive_compute = list(all_compute - set(active_compute))
 
-    # PySR-style mutation categorical weights
-    weightMutateOperator = 1.0
-    weightRewireIn1      = 1.0
-    weightRewireIn2      = 1.0
+    # --- Mutation type weights ---
+    # Balanced between constant tuning and structural exploration.
+    # The old 10:1 constant:operator ratio meant >60% of mutations just tweaked
+    # numbers — great for polishing but terrible for structural discovery.
+    weightMutateOperator = 2.0     # was 1.0 — doubled for more structural change
+    weightRewireIn1      = 1.5     # was 1.0 — rewiring IS structural change
+    weightRewireIn2      = 1.5     # was 1.0
     weightRewireIn3      = 0.5 if CGPEquation.OPS_TERNARY else 0.0
-    weightMutateConstant = 10.0  # PySR's heavy bias toward tuning constants
-    weightScaleConstant  = 1.5
+    weightMutateConstant = 7.0     # was 10.0 — still dominant but less so
+    weightScaleConstant  = 1.0     # was 1.5
     weightResetConstant  = 0.5
     weightSwapOperands   = 0.5
-    weightSwapPow        = 0.3   # specifically swap pow base↔exponent
+    weightSwapPow        = 0.3
+    # NEW structural mutation types
+    weightCompose        = 1.5     # wrap active subexpr in a new unary op
+    weightDecompose      = 1.0     # split output into sum/product with new term
+    weightInjectSubtree  = 1.2     # replace inactive region with coherent mini-tree
 
-    mut_types = ['operator', 'rewire1', 'rewire2', 'rewire3', 'perturb_const', 'scale_const', 'reset_const', 'swap_ops', 'swap_pow']
+    mut_types = ['operator', 'rewire1', 'rewire2', 'rewire3',
+                 'perturb_const', 'scale_const', 'reset_const',
+                 'swap_ops', 'swap_pow',
+                 'compose', 'decompose', 'inject_subtree']
     mut_weights = [
         weightMutateOperator, weightRewireIn1, weightRewireIn2, weightRewireIn3,
         weightMutateConstant, weightScaleConstant, weightResetConstant,
-        weightSwapOperands, weightSwapPow
+        weightSwapOperands, weightSwapPow,
+        weightCompose, weightDecompose, weightInjectSubtree
     ]
 
     for _ in range(mut_rate):
         # 10% chance: shift output pointer
         if random.random() < 0.10:
             child_eq.out_idx = random.randint(0, n_features + child_eq.max_nodes - 1)
+            child_eq.update_active_nodes()
+            active_compute   = [i - n_features for i in child_eq.active_nodes if i >= n_features]
+            inactive_compute = list(all_compute - set(active_compute))
             continue
 
-        if inactive_compute and random.random() < 0.80:
+        # --- Improved active/inactive balance ---
+        # Old: 80% inactive. New: 50% inactive.
+        # Mutating only junk nodes is neutral drift — useful for CGP but
+        # crippling when you need to actually change the expression structure.
+        if inactive_compute and random.random() < 0.50:
             node_idx = random.choice(inactive_compute)
         else:
             node_idx = (random.choice(active_compute) if active_compute else random.randint(0, child_eq.max_nodes - 1))
 
         target = child_eq.nodes[node_idx]
         max_connect = max(0, n_features + node_idx - 1)
-        
-        # Sample the mutation type using PySR weights
+
+        # Sample the mutation type using weights
         choice = random.choices(mut_types, weights=mut_weights, k=1)[0]
 
         if choice == 'operator':
@@ -5065,9 +5204,6 @@ def mutate(parent_eq, n_features, feature_names, mut_rate=None, temperature=0.0,
             if target.op in child_eq.OPS_BINARY_SET:
                 target.in1, target.in2 = target.in2, target.in1
         elif choice == 'swap_pow':
-            # Targeted pow-operand swap: find a pow node in the active graph
-            # and swap its base ↔ exponent.  This is the key mutation for
-            # transitioning between x^c (power law) and c^x (exponential).
             pow_nodes = [i - n_features for i in child_eq.active_nodes
                          if i >= n_features
                          and child_eq.nodes[i - n_features].op == 'pow']
@@ -5076,9 +5212,117 @@ def mutate(parent_eq, n_features, feature_names, mut_rate=None, temperature=0.0,
                 pn = child_eq.nodes[pi]
                 pn.in1, pn.in2 = pn.in2, pn.in1
             else:
-                # Fallback to regular swap_ops if no pow nodes exist
                 if target.op in child_eq.OPS_BINARY_SET:
                     target.in1, target.in2 = target.in2, target.in1
+
+        elif choice == 'compose':
+            # COMPOSE: wrap a random active node in a new unary operator.
+            # e.g. node_A → sin(node_A), exp(node_A), log(node_A)
+            # This is the key mutation for discovering nested function composition
+            # like sin(x²) or log(x+y) that point-mutation can't reach in one step.
+            unary_ops = CGPEquation.OPS_UNARY or []
+            if active_compute and unary_ops:
+                wrap_target_local = random.choice(active_compute)
+                wrap_target_global = n_features + wrap_target_local
+                # Find a free slot after the wrap target
+                free_after = [s for s in range(wrap_target_local + 1, child_eq.max_nodes)
+                              if s not in set(active_compute)]
+                if free_after:
+                    dst = free_after[0]
+                    new_op = random.choice(unary_ops)
+                    child_eq.nodes[dst] = CGPNode(new_op, wrap_target_global, 0,
+                                                   random.gauss(0, 1.0))
+                    # Rewire anything that referenced wrap_target to use the new node
+                    new_global = n_features + dst
+                    for ac in active_compute:
+                        if ac == dst:
+                            continue
+                        nd = child_eq.nodes[ac]
+                        if nd.in1 == wrap_target_global and ac > dst:
+                            nd.in1 = new_global
+                        if nd.in2 == wrap_target_global and ac > dst:
+                            nd.in2 = new_global
+                    if child_eq.out_idx == wrap_target_global:
+                        child_eq.out_idx = new_global
+                    child_eq.update_active_nodes()
+                    active_compute   = [i - n_features for i in child_eq.active_nodes if i >= n_features]
+                    inactive_compute = list(all_compute - set(active_compute))
+
+        elif choice == 'decompose':
+            # DECOMPOSE: add a new term to the output via + or *.
+            # Turns expr → expr + f(x_i) or expr * f(x_i).
+            # This is critical for discovering additive/multiplicative corrections
+            # that seeds miss, e.g. going from "x²" to "x² + sin(y)".
+            active_set = set(active_compute)
+            free_slots = [s for s in range(child_eq.max_nodes) if s not in active_set]
+            binary_ops_avail = CGPEquation.OPS_BINARY or []
+            if len(free_slots) >= 3 and binary_ops_avail:
+                # Build a small new term in free slots
+                s1, s2, s3 = free_slots[0], free_slots[1], free_slots[2]
+                # Pick a feature (prefer unused ones)
+                used_feats = set()
+                for idx in child_eq.active_nodes:
+                    if idx < n_features:
+                        used_feats.add(idx)
+                unused = [f for f in range(n_features) if f not in used_feats]
+                new_feat = random.choice(unused) if unused else random.randint(0, n_features - 1)
+                # Build: unary(feature) or const*feature
+                unary_ops = CGPEquation.OPS_UNARY or []
+                if unary_ops and random.random() < 0.6:
+                    new_op = random.choice(unary_ops)
+                    child_eq.nodes[s1] = CGPNode(new_op, new_feat, 0, random.gauss(0, 2.0))
+                    new_term = n_features + s1
+                    combine_slot = s2
+                else:
+                    c_val = random.choice([0.5, 1.0, 2.0, -1.0, np.pi, 0.1])
+                    child_eq.nodes[s1] = CGPNode('const', 0, 0, c_val)
+                    child_eq.nodes[s2] = CGPNode('*', n_features + s1, new_feat, 0.0)
+                    new_term = n_features + s2
+                    combine_slot = s3
+                # Combine with current output
+                combine_op = random.choices(['+', '*', '-'],
+                                            weights=[5, 3, 2], k=1)[0]
+                if combine_op in set(binary_ops_avail):
+                    child_eq.nodes[combine_slot] = CGPNode(
+                        combine_op, child_eq.out_idx, new_term, 0.0)
+                    child_eq.out_idx = n_features + combine_slot
+                    child_eq.update_active_nodes()
+                    active_compute   = [i - n_features for i in child_eq.active_nodes if i >= n_features]
+                    inactive_compute = list(all_compute - set(active_compute))
+
+        elif choice == 'inject_subtree':
+            # INJECT SUBTREE: replace a chunk of inactive nodes with a coherent
+            # random mini-expression and wire it into the active graph.
+            # Unlike random node-by-node mutation, this creates *meaningful*
+            # sub-expressions that the crossover can later combine.
+            if len(inactive_compute) >= 2:
+                # Pick a contiguous region of inactive slots
+                inactive_sorted = sorted(inactive_compute)
+                start = random.choice(inactive_sorted[:max(1, len(inactive_sorted) - 2)])
+                avail_inputs = list(range(n_features))
+                # Also allow referencing existing active nodes below start
+                for ac in active_compute:
+                    if ac < start:
+                        avail_inputs.append(n_features + ac)
+                root = _build_random_mini_tree(
+                    child_eq, n_features, start, max_depth=3,
+                    available_inputs=avail_inputs)
+                if root is not None:
+                    # 40% chance: wire it into the output to make it active
+                    if random.random() < 0.40:
+                        active_set = set(active_compute)
+                        free_after_root = [s for s in range(root - n_features + 1, child_eq.max_nodes)
+                                           if s not in active_set]
+                        if free_after_root:
+                            cs = free_after_root[0]
+                            combine_op = random.choice(['+', '*'])
+                            if combine_op in set(CGPEquation.OPS_BINARY or []):
+                                child_eq.nodes[cs] = CGPNode(
+                                    combine_op, child_eq.out_idx, root, 0.0)
+                                child_eq.out_idx = n_features + cs
+                    child_eq.update_active_nodes()
+                    active_compute   = [i - n_features for i in child_eq.active_nodes if i >= n_features]
+                    inactive_compute = list(all_compute - set(active_compute))
 
         target.const_val = max(-1e6, min(1e6, target.const_val))
 
@@ -7801,6 +8045,279 @@ def macro_piecewise(cgp_eq, n_features, feature_names):
     return child
 
 
+def macro_nest_compound(cgp_eq, n_features, feature_names, op_affinity=None):
+    """
+    Compound nesting macro-mutation: builds a multi-node sub-expression on a
+    NEW feature and combines it with the current output.
+
+    Unlike macro_grow (which adds one node) or macro_graft (which adds a raw
+    feature), this builds a 2-4 node expression on a randomly chosen feature
+    and then merges it with the existing output via +, *, or /.
+
+    This is the key mutation for discovering compound corrections like:
+      expr + c*sin(x2)
+      expr * exp(-c*x3)
+      expr / (1 + x4²)
+
+    These require multiple coordinated nodes that point-mutation almost never
+    produces simultaneously.
+    """
+    child = copy.deepcopy(cgp_eq)
+    child.update_active_nodes()
+
+    active = sorted(i for i in child.active_nodes if i >= n_features)
+    max_active = max(active) if active else (n_features - 1)
+    all_slots = range(n_features, n_features + child.max_nodes)
+    free_slots = [s for s in all_slots
+                  if s not in child.active_nodes and s > max_active]
+
+    # Need at least 4 free slots for a meaningful compound expression
+    if len(free_slots) < 4:
+        return child
+
+    # Pick a feature — prefer unused ones
+    used_feats = _active_feature_set(child, n_features)
+    unused = [f for f in range(n_features) if f not in used_feats]
+    feat = random.choice(unused) if unused else random.randint(0, n_features - 1)
+
+    unary_ops  = [op for op in CGPEquation.OPS_UNARY  if op in ALLOWED_OPS]
+    binary_ops = [op for op in CGPEquation.OPS_BINARY if op in ALLOWED_OPS]
+    cur_out = child.out_idx
+
+    # Strategy selection based on available ops
+    strategies = []
+    # Strategy 1: unary(c * feature)  — e.g. sin(2*x), exp(-0.5*x), log(3*x)
+    if unary_ops and '*' in ALLOWED_OPS and 'const' in ALLOWED_OPS:
+        strategies.append('unary_scaled')
+    # Strategy 2: feature^c  — power-law new term
+    if 'pow' in ALLOWED_OPS and 'const' in ALLOWED_OPS:
+        strategies.append('power_term')
+    # Strategy 3: c1 * unary1(feat) + c2 * unary2(feat)  — e.g. sin+cos combo
+    if len(unary_ops) >= 2 and '*' in ALLOWED_OPS and '+' in ALLOWED_OPS and 'const' in ALLOWED_OPS and len(free_slots) >= 7:
+        strategies.append('dual_unary')
+    # Strategy 4: feature * other_active_node  — interaction term
+    if '*' in ALLOWED_OPS and active:
+        strategies.append('interaction')
+    # Strategy 5: raw unary(feature) — simplest compound
+    if unary_ops:
+        strategies.append('simple_unary')
+
+    if not strategies:
+        return child
+
+    strategy = random.choice(strategies)
+    nf = n_features  # shorthand
+
+    if strategy == 'unary_scaled':
+        s1, s2, s3, s4 = free_slots[0], free_slots[1], free_slots[2], free_slots[3]
+        c_val = random.choice([0.5, 1.0, 1.5, 2.0, 3.0, np.pi, 0.1, -1.0, -0.5])
+        child.nodes[s1 - nf] = CGPNode('const', 0, 0, c_val)
+        child.nodes[s2 - nf] = CGPNode('*', s1, feat)
+        child.nodes[s3 - nf] = CGPNode(random.choice(unary_ops), s2, 0)
+        combine_op = random.choices(['+', '*', '-'], weights=[5, 3, 2], k=1)[0]
+        if combine_op not in set(binary_ops):
+            combine_op = '+' if '+' in set(binary_ops) else binary_ops[0]
+        child.nodes[s4 - nf] = CGPNode(combine_op, cur_out, s3)
+        child.out_idx = s4
+
+    elif strategy == 'power_term':
+        s1, s2, s3, s4 = free_slots[0], free_slots[1], free_slots[2], free_slots[3]
+        exp_val = random.choice([0.5, 1.5, 2.0, 2.5, 3.0, -0.5, -1.0, -2.0])
+        child.nodes[s1 - nf] = CGPNode('const', 0, 0, exp_val)
+        child.nodes[s2 - nf] = CGPNode('pow', feat, s1)
+        child.nodes[s3 - nf] = CGPNode('const', 0, 0, random.uniform(0.1, 5.0))
+        child.nodes[s4 - nf] = CGPNode('+' if '+' in set(binary_ops) else binary_ops[0],
+                                         cur_out,
+                                         s2 if random.random() < 0.5 else s3)
+        # Actually: expr + c * feat^p
+        if '*' in set(binary_ops) and len(free_slots) >= 5:
+            s5 = free_slots[4]
+            child.nodes[s4 - nf] = CGPNode('*', s3, s2)  # c * feat^p
+            child.nodes[s5 - nf] = CGPNode('+' if '+' in set(binary_ops) else binary_ops[0],
+                                             cur_out, s4)
+            child.out_idx = s5
+        else:
+            child.out_idx = s4
+
+    elif strategy == 'dual_unary':
+        s1, s2, s3, s4, s5, s6, s7 = free_slots[:7]
+        u1, u2 = random.sample(unary_ops, 2)
+        c1 = random.uniform(0.5, 3.0)
+        c2 = random.uniform(0.5, 3.0)
+        child.nodes[s1 - nf] = CGPNode(u1, feat, 0)
+        child.nodes[s2 - nf] = CGPNode('const', 0, 0, c1)
+        child.nodes[s3 - nf] = CGPNode('*', s2, s1)          # c1 * u1(feat)
+        child.nodes[s4 - nf] = CGPNode(u2, feat, 0)
+        child.nodes[s5 - nf] = CGPNode('const', 0, 0, c2)
+        child.nodes[s6 - nf] = CGPNode('*', s5, s4)          # c2 * u2(feat)
+        combine_inner = '+' if '+' in set(binary_ops) else binary_ops[0]
+        child.nodes[s7 - nf] = CGPNode(combine_inner, cur_out, s3)
+        child.out_idx = s7
+
+    elif strategy == 'interaction':
+        s1, s2 = free_slots[0], free_slots[1]
+        # Pick a random active node to interact with
+        partner = random.choice(active)
+        child.nodes[s1 - nf] = CGPNode('*', feat, partner)
+        combine_op = '+' if '+' in set(binary_ops) else binary_ops[0]
+        child.nodes[s2 - nf] = CGPNode(combine_op, cur_out, s1)
+        child.out_idx = s2
+
+    elif strategy == 'simple_unary':
+        s1, s2 = free_slots[0], free_slots[1]
+        child.nodes[s1 - nf] = CGPNode(random.choice(unary_ops), feat, 0)
+        combine_op = random.choices(['+', '*'], weights=[3, 2], k=1)[0]
+        if combine_op not in set(binary_ops):
+            combine_op = binary_ops[0] if binary_ops else '+'
+        child.nodes[s2 - nf] = CGPNode(combine_op, cur_out, s1)
+        child.out_idx = s2
+
+    child.update_active_nodes()
+    return child
+
+
+def macro_inject_subtree(cgp_eq, n_features, feature_names):
+    """
+    Inject a coherent random sub-expression into the CGP graph as a new
+    independent branch, then wire it into the output.
+
+    Unlike point-mutation (which changes one node at a time) or macro_grow
+    (which adds one node), this builds a complete 2-4 node sub-expression
+    from scratch and adds it to the output.  The sub-expression is built
+    top-down as a tree, guaranteeing it computes something meaningful.
+
+    Templates (randomly selected):
+      1. f(x_i op x_j)   — binary combo wrapped in unary
+      2. f(x_i) op g(x_j) — product/sum of independent transforms
+      3. c * f(c2 * x_i)  — scaled transform with frequency
+      4. (x_i op c) op x_j — nested binary with constant
+
+    This mutation is the primary mechanism for discovering novel functional
+    forms that weren't covered by seeds.
+    """
+    child = copy.deepcopy(cgp_eq)
+    child.update_active_nodes()
+
+    active = sorted(i for i in child.active_nodes if i >= n_features)
+    max_active = max(active) if active else (n_features - 1)
+    all_slots = range(n_features, n_features + child.max_nodes)
+    free_slots = [s for s in all_slots
+                  if s not in child.active_nodes and s > max_active]
+
+    if len(free_slots) < 5:
+        return child
+
+    unary_ops  = [op for op in CGPEquation.OPS_UNARY  if op in ALLOWED_OPS]
+    binary_ops = [op for op in CGPEquation.OPS_BINARY if op in ALLOWED_OPS]
+
+    if not binary_ops:
+        return child
+
+    nf = n_features
+    cur_out = child.out_idx
+
+    # Pick features — prefer diverse ones
+    used_feats = _active_feature_set(child, n_features)
+    all_feats = list(range(n_features))
+    unused = [f for f in all_feats if f not in used_feats]
+
+    def _pick_feat(prefer_unused=True):
+        if prefer_unused and unused:
+            return random.choice(unused)
+        return random.choice(all_feats)
+
+    template = random.choices(
+        ['unary_binary', 'product_transforms', 'scaled_transform',
+         'nested_binary', 'triple_interaction'],
+        weights=[3, 3, 2, 2, 1 if n_features >= 3 else 0],
+        k=1)[0]
+
+    if template == 'unary_binary' and unary_ops and len(free_slots) >= 4:
+        # f(x_i op x_j) — e.g. sin(x1 * x2), exp(x1 + x2)
+        s1, s2, s3, s4 = free_slots[:4]
+        fi, fj = _pick_feat(), _pick_feat(prefer_unused=False)
+        inner_op = random.choice(binary_ops)
+        outer_op = random.choice(unary_ops)
+        child.nodes[s1 - nf] = CGPNode(inner_op, fi, fj, random.gauss(0, 1.0))
+        child.nodes[s2 - nf] = CGPNode(outer_op, s1, 0, random.gauss(0, 1.0))
+        combine = random.choices(['+', '*', '-'], weights=[4, 3, 2], k=1)[0]
+        if combine not in set(binary_ops):
+            combine = binary_ops[0]
+        child.nodes[s3 - nf] = CGPNode('const', 0, 0, random.uniform(0.1, 3.0))
+        child.nodes[s4 - nf] = CGPNode(combine, cur_out, s2)
+        child.out_idx = s4
+
+    elif template == 'product_transforms' and len(unary_ops) >= 2 and len(free_slots) >= 5:
+        # f(x_i) * g(x_j) — e.g. sin(x1) * exp(x2)
+        s1, s2, s3, s4, s5 = free_slots[:5]
+        fi, fj = _pick_feat(), _pick_feat(prefer_unused=False)
+        u1 = random.choice(unary_ops)
+        u2 = random.choice(unary_ops)
+        child.nodes[s1 - nf] = CGPNode(u1, fi, 0, random.gauss(0, 1.0))
+        child.nodes[s2 - nf] = CGPNode(u2, fj, 0, random.gauss(0, 1.0))
+        child.nodes[s3 - nf] = CGPNode('*' if '*' in set(binary_ops) else binary_ops[0],
+                                         s1, s2)
+        combine = random.choices(['+', '*'], weights=[3, 2], k=1)[0]
+        if combine not in set(binary_ops):
+            combine = binary_ops[0]
+        child.nodes[s4 - nf] = CGPNode('const', 0, 0, random.uniform(0.1, 5.0))
+        child.nodes[s5 - nf] = CGPNode(combine, cur_out, s3)
+        child.out_idx = s5
+
+    elif template == 'scaled_transform' and unary_ops and 'const' in ALLOWED_OPS and len(free_slots) >= 5:
+        # c1 * f(c2 * x_i) — e.g. 3.0 * sin(2.5 * x)
+        s1, s2, s3, s4, s5 = free_slots[:5]
+        fi = _pick_feat()
+        child.nodes[s1 - nf] = CGPNode('const', 0, 0,
+                                         random.choice([0.5, 1.0, 1.5, 2.0, 3.0,
+                                                         np.pi, 2*np.pi, 0.1]))
+        child.nodes[s2 - nf] = CGPNode('*' if '*' in set(binary_ops) else binary_ops[0],
+                                         s1, fi)
+        child.nodes[s3 - nf] = CGPNode(random.choice(unary_ops), s2, 0)
+        child.nodes[s4 - nf] = CGPNode('const', 0, 0, random.uniform(0.1, 5.0))
+        combine = '+' if '+' in set(binary_ops) else binary_ops[0]
+        child.nodes[s5 - nf] = CGPNode(combine, cur_out, s3)
+        child.out_idx = s5
+
+    elif template == 'nested_binary' and len(free_slots) >= 4:
+        # (x_i op c) op2 x_j — e.g. (x1 + 3) * x2, (x1 / 2) + x2
+        s1, s2, s3, s4 = free_slots[:4]
+        fi, fj = _pick_feat(), _pick_feat(prefer_unused=False)
+        op1 = random.choice(binary_ops)
+        op2 = random.choice(binary_ops)
+        child.nodes[s1 - nf] = CGPNode('const', 0, 0, random.gauss(0, 3.0))
+        child.nodes[s2 - nf] = CGPNode(op1, fi, s1)
+        child.nodes[s3 - nf] = CGPNode(op2, s2, fj)
+        combine = '+' if '+' in set(binary_ops) else binary_ops[0]
+        child.nodes[s4 - nf] = CGPNode(combine, cur_out, s3)
+        child.out_idx = s4
+
+    elif template == 'triple_interaction' and n_features >= 3 and len(free_slots) >= 4:
+        # x_i * x_j * x_k — three-way product
+        s1, s2, s3, s4 = free_slots[:4]
+        feats = random.sample(all_feats, min(3, n_features))
+        mul_op = '*' if '*' in set(binary_ops) else binary_ops[0]
+        child.nodes[s1 - nf] = CGPNode(mul_op, feats[0], feats[1])
+        child.nodes[s2 - nf] = CGPNode(mul_op, s1, feats[2] if len(feats) > 2 else feats[0])
+        combine = '+' if '+' in set(binary_ops) else binary_ops[0]
+        child.nodes[s3 - nf] = CGPNode('const', 0, 0, random.uniform(0.01, 5.0))
+        child.nodes[s4 - nf] = CGPNode(combine, cur_out, s2)
+        child.out_idx = s4
+
+    else:
+        # Fallback: simple feature addition
+        if len(free_slots) >= 2:
+            s1, s2 = free_slots[0], free_slots[1]
+            fi = _pick_feat()
+            child.nodes[s1 - nf] = CGPNode('const', 0, 0, random.uniform(0.1, 5.0))
+            combine = '+' if '+' in set(binary_ops) else binary_ops[0]
+            child.nodes[s2 - nf] = CGPNode(combine, cur_out, fi)
+            child.out_idx = s2
+
+    child.update_active_nodes()
+    return child
+
+
 def _create_offspring(action, parent, population, n_features, feat_names,
                       eff_rate, sa_temp, parent_sigma, X,
                       op_affinity=None, y_residuals=None):
@@ -7859,6 +8376,11 @@ def _create_offspring(action, parent, population, n_features, feat_names,
         child_tree = macro_ablate_feature(parent.tree, n_features)
     elif action == 'piecewise':
         child_tree = macro_piecewise(parent.tree, n_features, feat_names)
+    elif action == 'nest':
+        child_tree = macro_nest_compound(parent.tree, n_features, feat_names,
+                                          op_affinity=op_affinity)
+    elif action == 'inject':
+        child_tree = macro_inject_subtree(parent.tree, n_features, feat_names)
     else:  # mutate
         child_tree = mutate(parent.tree, n_features, feat_names,
                             mut_rate=eff_rate, temperature=sa_temp,
@@ -7924,8 +8446,12 @@ def evolve_island_chunk(args):
 
     # ── IMPROVEMENT: Adaptive reproductive operator tracker ────────────────
     # Tracks which operators produce accepted children; adapts weights over time.
-    _repro_ops_base = ['mutate', 'crossover', 'semantic_xover', 'grow', 'prune', 'graft', 'optimize', 'boost', 'do_nothing', 'div', 'trig', 'ablate', 'piecewise']
-    _repro_weights_base = [4.0, 1.0, 0.8, 0.5, 0.5, 0.5, 1.5, 0.6, 0.5, 0.5, 0.8, 0.3, 0.6 if IF_ELSE_ENABLED else 0.0]
+    _repro_ops_base = ['mutate', 'crossover', 'semantic_xover', 'grow', 'prune', 'graft', 'optimize', 'boost', 'do_nothing', 'div', 'trig', 'ablate', 'piecewise', 'nest', 'inject']
+    _repro_weights_base = [3.5, 1.0, 0.8, 0.7, 0.5, 0.7, 1.5, 0.6, 0.3, 0.5, 0.8, 0.3, 0.6 if IF_ELSE_ENABLED else 0.0, 1.2, 1.0]
+    #                      ^^^                  ^^^       ^^^                 ^^^                                               ^^^  ^^^
+    #                  mutate↓  grow↑  graft↑  do_nothing↓                                                               nest  inject
+    # Net effect: ~25% of actions are now structural exploration (grow+graft+nest+inject+trig+div)
+    # vs ~10% before.  mutate still dominates but its internal weights are rebalanced too.
     _mut_tracker = AdaptiveMutationTracker(_repro_ops_base, _repro_weights_base, alpha=0.07)
 
     # ── IMPROVEMENT: Operator affinity (updated every 200 gens) ───────────
@@ -8034,9 +8560,25 @@ def evolve_island_chunk(args):
 
         # ------------------------------------------------------------------ #
         # 2. PySR-Style Top-Level Operator Action Selection (adaptive weights)
+        #    with stagnation-aware structural exploration boost
         # ------------------------------------------------------------------ #
         repro_ops = _repro_ops_base
-        repro_weights = _mut_tracker.get_weights()
+        repro_weights = list(_mut_tracker.get_weights())
+
+        # Stagnation boost: when stuck, shift weight toward structural mutations
+        # (nest, inject, grow, graft, trig, div) at the expense of mutate/optimize.
+        # This prevents the search from endlessly polishing constants when it
+        # needs a structural breakthrough.
+        if stag_frac > 0.3:
+            structural_boost = 1.0 + 2.0 * min(1.0, (stag_frac - 0.3) / 0.5)
+            _structural_ops = {'grow', 'graft', 'nest', 'inject', 'trig', 'div', 'crossover', 'semantic_xover'}
+            _exploitation_ops = {'mutate', 'optimize', 'do_nothing'}
+            for k, op_name in enumerate(repro_ops):
+                if op_name in _structural_ops:
+                    repro_weights[k] *= structural_boost
+                elif op_name in _exploitation_ops:
+                    repro_weights[k] *= max(0.3, 1.0 / structural_boost)
+
         action = random.choices(repro_ops, weights=repro_weights, k=1)[0]
 
         child_tree, child_sigma = _create_offspring(
@@ -8474,8 +9016,8 @@ def evolve_afpo(population, X, y_target, type_code,
 
     # ── Adaptive reproductive operator tracker (same as island model) ─────
     _repro_ops_base = ['mutate', 'crossover', 'semantic_xover', 'grow', 'prune', 'graft',
-                       'optimize', 'boost', 'do_nothing', 'div', 'trig', 'ablate', 'piecewise']
-    _repro_weights_base = [4.0, 1.0, 0.8, 0.5, 0.5, 0.5, 1.5, 0.6, 0.5, 0.5, 0.8, 0.3, 0.6 if IF_ELSE_ENABLED else 0.0]
+                       'optimize', 'boost', 'do_nothing', 'div', 'trig', 'ablate', 'piecewise', 'nest', 'inject']
+    _repro_weights_base = [3.5, 1.0, 0.8, 0.7, 0.5, 0.7, 1.5, 0.6, 0.3, 0.5, 0.8, 0.3, 0.6 if IF_ELSE_ENABLED else 0.0, 1.2, 1.0]
     _mut_tracker = AdaptiveMutationTracker(_repro_ops_base, _repro_weights_base, alpha=0.07)
 
     local_stag = stag_counter
@@ -8530,8 +9072,18 @@ def evolve_afpo(population, X, y_target, type_code,
 
         # ------------------------------------------------------------------ #
         # PySR-Style Top-Level Operator Action Selection (adaptive weights)
+        #   with stagnation-aware structural exploration boost
         # ------------------------------------------------------------------ #
-        repro_weights = _mut_tracker.get_weights()
+        repro_weights = list(_mut_tracker.get_weights())
+        if stag_frac > 0.3:
+            structural_boost = 1.0 + 2.0 * min(1.0, (stag_frac - 0.3) / 0.5)
+            _structural_ops = {'grow', 'graft', 'nest', 'inject', 'trig', 'div', 'crossover', 'semantic_xover'}
+            _exploitation_ops = {'mutate', 'optimize', 'do_nothing'}
+            for k, op_name in enumerate(_repro_ops_base):
+                if op_name in _structural_ops:
+                    repro_weights[k] *= structural_boost
+                elif op_name in _exploitation_ops:
+                    repro_weights[k] *= max(0.3, 1.0 / structural_boost)
         action = random.choices(_repro_ops_base, weights=repro_weights, k=1)[0]
 
         child_tree, child_sigma = _create_offspring(
