@@ -9603,22 +9603,20 @@ except ImportError:
     HAS_SKLEARN_GP = False
 
 
-def cgp_to_vector(cgp_eq, max_nodes):
+def cgp_to_vector(cgp_eq, max_nodes, X_probe=None):
     """
     Encode a CGPEquation as a fixed-length numeric vector suitable for GP
     surrogate modelling.
 
-    Encoding per node (4 values):
-      [op_index_normalised,  in1_normalised,  in2_normalised,  const_val_clipped]
+    Encoding per node (5 values):
+      [op_index_normalised, in1_normalised, in2_normalised, in3_normalised, const_val_norm]
 
-    Plus one trailing element: out_idx_normalised.
+    Plus:
+      - one trailing element for out_idx_normalised.
+      - phenotypic probe outputs (if X_probe is provided).
 
-    Total length: max_nodes * 4 + 1.
-
-    The encoding is designed so that:
-      • Structurally similar graphs map to nearby vectors.
-      • Constant values are included but clipped to [-250.0, 250.0] to prevent
-        a single outlier constant from dominating the kernel distance.
+    Inactive nodes are masked (all features set to -1.0) to reduce genotype noise.
+    Constants are squashed using tanh to handle wide ranges gracefully.
     """
     n_feat = cgp_eq.n_features
     total_slots = n_feat + max_nodes
@@ -9626,20 +9624,44 @@ def cgp_to_vector(cgp_eq, max_nodes):
     n_ops = len(ops_list)
     op_to_idx = {op: i for i, op in enumerate(ops_list)}
 
-    vec = np.zeros(max_nodes * 4 + 1, dtype=np.float64)
-    for i, node in enumerate(cgp_eq.nodes[:max_nodes]):
-        base = i * 4
-        # Normalised op index in [0, 1]
-        vec[base + 0] = op_to_idx.get(node.op, 0) / max(n_ops - 1, 1)
-        # Normalised input indices in [0, 1]
-        vec[base + 1] = node.in1 / max(total_slots - 1, 1)
-        vec[base + 2] = node.in2 / max(total_slots - 1, 1)
-        # Clipped constant value
-        vec[base + 3] = np.clip(node.const_val, -250.0, 250.0) / 10.0
+    cgp_eq.update_active_nodes()
+    active = cgp_eq.active_nodes
 
-    # Normalised output index
-    vec[-1] = cgp_eq.out_idx / max(total_slots - 1, 1)
-    return vec
+    vec_parts = []
+
+    # 1. Genotype encoding
+    genotype_vec = np.full(max_nodes * 5, -1.0, dtype=np.float64)
+    for i, node in enumerate(cgp_eq.nodes[:max_nodes]):
+        idx = n_feat + i
+        if idx not in active:
+            continue
+
+        base = i * 5
+        # Normalised op index in [0, 1]
+        genotype_vec[base + 0] = op_to_idx.get(node.op, 0) / max(n_ops - 1, 1)
+        # Normalised input indices in [0, 1]
+        genotype_vec[base + 1] = node.in1 / max(total_slots - 1, 1)
+        genotype_vec[base + 2] = node.in2 / max(total_slots - 1, 1)
+        genotype_vec[base + 3] = node.in3 / max(total_slots - 1, 1)
+        # Squashed constant value in [-1, 1]
+        genotype_vec[base + 4] = np.tanh(node.const_val / 10.0)
+
+    vec_parts.append(genotype_vec)
+
+    # 2. Output pointer
+    vec_parts.append(np.array([cgp_eq.out_idx / max(total_slots - 1, 1)]))
+
+    # 3. Phenotypic encoding (Probe outputs)
+    if X_probe is not None:
+        try:
+            preds = cgp_eq.evaluate(X_probe)
+            # Normalise/clamp probe outputs to prevent scale issues in GP
+            preds = np.tanh(np.nan_to_num(preds, nan=0.0) / 10.0)
+            vec_parts.append(preds)
+        except Exception:
+            vec_parts.append(np.zeros(X_probe.shape[0]))
+
+    return np.concatenate(vec_parts)
 
 
 def _expected_improvement(mu, sigma, best_f, xi=0.01):
@@ -9668,12 +9690,14 @@ class BayesianCGPOptimizer:
     and uses Expected Improvement to select which candidates to evaluate.
     """
 
-    def __init__(self, n_features, max_nodes, feat_names, max_points=500,
-                 xi=0.01):
+    def __init__(self, n_features, max_nodes, feat_names, X_probe=None,
+                 max_points=500, xi=0.01):
         self.n_features = n_features
         self.max_nodes  = max_nodes
         self.feat_names = feat_names
-        self.vec_dim    = max_nodes * 4 + 1
+        self.X_probe    = X_probe
+        probe_size      = X_probe.shape[0] if X_probe is not None else 0
+        self.vec_dim    = max_nodes * 5 + 1 + probe_size
         self.xi         = xi
         self.max_points = max_points
 
@@ -9699,7 +9723,7 @@ class BayesianCGPOptimizer:
 
     def add_observation(self, individual, cgp_eq):
         """Record an evaluated individual."""
-        vec = cgp_to_vector(cgp_eq, self.max_nodes)
+        vec = cgp_to_vector(cgp_eq, self.max_nodes, X_probe=self.X_probe)
         y   = self._transform_fitness(individual.loss)
         self.X_observed.append(vec)
         self.y_observed.append(y)
@@ -9734,7 +9758,8 @@ class BayesianCGPOptimizer:
         if not self.gp_fitted or len(self.X_observed) < 10:
             return np.random.rand(len(candidate_trees))
 
-        vecs = np.array([cgp_to_vector(t, self.max_nodes) for t in candidate_trees])
+        vecs = np.array([cgp_to_vector(t, self.max_nodes, X_probe=self.X_probe)
+                         for t in candidate_trees])
         try:
             mu, sigma = self.gp.predict(vecs, return_std=True)
         except Exception:
@@ -9781,9 +9806,15 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
     print(f"  Exploration (xi)       : {BAYESIAN_EXPLORATION}")
     print("═" * 70 + "\n")
 
+    # Select phenotypic probe set: 20 points sampled from training data
+    _probe_n = min(20, X.shape[0])
+    _probe_idx = np.random.choice(X.shape[0], _probe_n, replace=False)
+    X_probe = X[_probe_idx]
+
     # One BO optimizer per output
     optimizers = [
         BayesianCGPOptimizer(n_features, CGP_NODES, feat_names,
+                             X_probe=X_probe,
                              max_points=BAYESIAN_MAX_GP_POINTS,
                              xi=BAYESIAN_EXPLORATION)
         for _ in range(n_outputs)
@@ -9970,6 +10001,8 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
                         X_screen, Y_screen[:, o_idx], out_types[o_idx],
                         target_grads=target_grads_list[o_idx])
                     screen_results.append((ci, child))
+                    # Even screening evaluations are useful data for the GP surrogate
+                    opt.add_observation(child, child.tree)
 
                 # Stage 2: pick best B from screening, evaluate on full data
                 screen_results.sort(key=lambda x: x[1].loss)
@@ -9993,6 +10026,7 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
                               f"New HoF (Comp {child.complexity:.0f}): "
                               f"loss={child.loss:.5f}  {metric}")
 
+                    # Update GP with full-fidelity evaluation
                     opt.add_observation(child, child.tree)
 
                 # ── Refit GP surrogate periodically ─────────────────────────
