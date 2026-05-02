@@ -600,8 +600,7 @@ _BINARY_SAFE = {
     'max':       np.maximum,
     'min':       np.minimum,
     # Base forced positive; exponent clamped to prevent ±∞
-    'pow':       lambda v1, v2: np.power(np.abs(v1) + 1e-30,
-                                         np.clip(v2, -10.0, 10.0)),
+    'pow':       lambda v1, v2: np.where(np.abs(np.round(v2) - v2) < 1e-4, np.where(np.abs(np.mod(np.round(v2), 2)) < 1e-8, np.power(np.abs(v1) + 1e-30, np.clip(v2, -250.0, 250.0)), np.copysign(np.power(np.abs(v1) + 1e-30, np.clip(v2, -250.0, 250.0)), v1)), np.power(np.abs(v1) + 1e-30, np.clip(v2, -250.0, 250.0))),
     'hypot':     lambda v1, v2: np.sqrt(v1**2 + v2**2),
     'atan2':     lambda v1, v2: np.arctan2(v1, v2),
     # Denominator guard prevents 0/0 at v1=v2=0
@@ -658,7 +657,7 @@ _UNARY_SAFE = {
     # NOTE: in safe mode exp is exp(-|v|) — a BOUNDED decay in [0,1].
     # This prevents fitness-killing overflow at the cost of changing the
     # function's meaning.  Use unsafe mode for the true exponential.
-    'exp':        lambda v: np.exp(-np.abs(v)),
+    'exp':        lambda v: np.exp(np.clip(v, -700.0, 700.0)),
     # Abs inside log → always real; log(0) avoided via abs (still -Inf at 0,
     # but nan_to_num handles it)
     'log':        lambda v: np.log(np.abs(v) + 1e-30),
@@ -671,7 +670,7 @@ _UNARY_SAFE = {
     # Fractional part: x - floor(x) ∈ [0,1). Useful for periodic/time data.
     'frac':       lambda v: v - np.floor(v),
     # Exponent clamped to avoid catastrophic overflow
-    '10^x':       lambda v: np.power(10.0, np.clip(v, -30.0, 30.0)),
+    '10^x':       lambda v: np.power(10.0, np.clip(v, -300.0, 300.0)),
     'log10':      lambda v: np.log10(np.abs(v) + 1e-30),
     # Exp argument clamped → sigmoid never overflows
     'sigmoid':    lambda v: 1.0 / (1.0 + np.exp(-np.clip(v, -50.0, 50.0))),
@@ -779,10 +778,10 @@ def select_ops_safety():
         'harmonic':  ("2v1v2/(|v1+v2|+ε) → bounded",       "2v1v2/(v1+v2)   → NaN/Inf when v1=−v2"),
         'geometric': ("sqrt(|v1·v2|)      → always real",   "sqrt(v1·v2)     → NaN for negative product"),
         'tan':       ("sin/cos clamped to ±1e6",            "tan(v)          → Inf near π/2 multiples"),
-        'exp':       ("exp(−|v|) ∈ (0,1]  BOUNDED DECAY",   "exp(v)          → TRUE exp, overflows for v≫0"),
+        'exp':       ("exp(clip(v, -700.0, 700.0)) → no overflow", "exp(v)          → TRUE exp, overflows for v≫0"),
         'log':       ("log(|v|+ε)         → always finite",  "log(v)          → NaN for v≤0"),
         'sqrt':      ("sqrt(|v|)          → always real",    "sqrt(v)         → NaN for v<0"),
-        '10^x':      ("10^clip(v,−30,30)  → no overflow",    "10^v            → Inf for v>~308"),
+        '10^x':      ("10^clip(v,-300,300)  → no overflow",   "10^v            → Inf for v>~308"),
         'log10':     ("log10(|v|+ε)       → always finite",  "log10(v)        → NaN for v≤0"),
         'sigmoid':   ("σ(clip(v,−50,50))  → no overflow",    "σ(v)            → Inf for v<−710"),
         'gaussian':  ("exp(−clip(v²,500)) → no underflow",   "exp(−v²)        → underflow for large v"),
@@ -796,7 +795,7 @@ def select_ops_safety():
     print("═" * 78)
     print("Controls whether operations guard against domain errors.\n")
     print("  [S] SAFE     — all ops are total functions; NaN/Inf can never escape")
-    print("                 a node.  Some ops modified (exp→exp(−|v|) decay curve).")
+    print("                 a node.  Exponents are clipped to prevent Inf.")
     print("                 Recommended for noisy data or when stability matters.\n")
     print("  [U] UNSAFE   — raw numpy semantics; domain violations yield NaN/Inf")
     print("                 clamped by nan_to_num in evaluate().  Mathematically")
@@ -960,7 +959,7 @@ ALL_OP_DESCRIPTIONS = {
     'sin':       "Sine                 sin(x)   — oscillation, periodicity",
     'cos':       "Cosine               cos(x)   — oscillation (phase-shifted)",
     'tan':       "Tangent              tan(x)   — sin/cos ratio, singularities",
-    'exp':       "Exp-decay            exp(-|x|)— bounded exponential, decay",
+    'exp':       "Exponential          exp(x)   — exponential growth/decay",
     'log':       "Natural log          log(|x|) — compresses large values",
     'sqrt':      "Square root          sqrt(|x|)— sublinear growth",
     'abs':       "Absolute value       |x|      — removes sign, very cheap",
@@ -2859,13 +2858,18 @@ class CGPEquation:
         # nested structures if they substantially reduce loss, while still
         # preferring simpler alternatives at similar accuracy.
         nested_constraints = {
-            'exp': [(['exp'], 50.0)],                          # exp(exp(x)) overflows
-            'sin': [(['sin', 'cos', 'tan'], 30.0)],           # trig(trig(x)) rarely useful
-            'cos': [(['sin', 'cos', 'tan'], 30.0)],
-            'tan': [(['sin', 'cos', 'tan'], 30.0)],
-            'pow': [(['pow'], 40.0), (['exp'], 50.0)],        # (x^a)^b = x^(a*b), exp^pow overflows
-            'square': [(['square', 'cube'], 20.0)],            # (x²)² = x⁴, just use pow
-            'log': [(['log', 'log10'], 30.0), (['exp'], 20.0)], # log(exp(x))=x, log(log(x)) domain issues
+            'exp': [(['exp'], 50.0), (['sin', 'cos', 'tan', 'tanh', 'sigmoid'], 40.0)],
+            'sin': [(['sin', 'cos', 'tan', 'tanh', 'sigmoid'], 40.0), (['exp', '10^x', 'log', 'log10'], 40.0)],
+            'cos': [(['sin', 'cos', 'tan', 'tanh', 'sigmoid'], 40.0), (['exp', '10^x', 'log', 'log10'], 40.0)],
+            'tan': [(['sin', 'cos', 'tan', 'tanh', 'sigmoid'], 40.0), (['exp', '10^x', 'log', 'log10'], 40.0)],
+            'tanh': [(['sin', 'cos', 'tan', 'tanh', 'sigmoid'], 40.0), (['exp', '10^x', 'log', 'log10'], 40.0)],
+            'sigmoid': [(['sin', 'cos', 'tan', 'tanh', 'sigmoid'], 40.0), (['exp', '10^x', 'log', 'log10'], 40.0)],
+            'pow': [(['pow'], 40.0), (['exp'], 50.0)],
+            'square': [(['square', 'cube'], 20.0)],
+            'cube': [(['square', 'cube'], 20.0)],
+            'log': [(['log', 'log10'], 30.0), (['exp', '10^x'], 20.0), (['sin', 'cos', 'tan', 'tanh', 'sigmoid'], 40.0)],
+            'log10': [(['log', 'log10'], 30.0), (['exp', '10^x'], 20.0), (['sin', 'cos', 'tan', 'tanh', 'sigmoid'], 40.0)],
+            '10^x': [(['10^x'], 50.0), (['sin', 'cos', 'tan', 'tanh', 'sigmoid'], 40.0)],
         }
 
         for idx in self.active_nodes:
@@ -6799,7 +6803,18 @@ def _adf_to_sympy(adf_dict, input_exprs, safe=True):
                 sbuf[slot] = v1 / v2
         elif op == 'pow':
             if safe:
-                sbuf[slot] = sympy.Abs(v1) ** sympy.Min(sympy.Max(v2, -10), 10)
+                v2c = sympy.Min(sympy.Max(v2, -250.0), 250.0)
+                try:
+                    v2_float = float(v2c)
+                    if abs(round(v2_float) - v2_float) < 1e-4:
+                        if abs(round(v2_float) % 2) == 1:
+                            sbuf[slot] = sympy.sign(v1) * (sympy.Abs(v1) + sympy.Float(1e-30)) ** v2c
+                        else:
+                            sbuf[slot] = (sympy.Abs(v1) + sympy.Float(1e-30)) ** v2c
+                    else:
+                        sbuf[slot] = (sympy.Abs(v1) + sympy.Float(1e-30)) ** v2c
+                except Exception:
+                    sbuf[slot] = (sympy.Abs(v1) + sympy.Float(1e-30)) ** v2c
             else:
                 sbuf[slot] = v1 ** v2
         elif op == 'sin':
@@ -6822,7 +6837,7 @@ def _adf_to_sympy(adf_dict, input_exprs, safe=True):
             else:
                 sbuf[slot] = sympy.floor(v1 / v2)
         elif op == 'exp':
-            sbuf[slot] = sympy.exp(-sympy.Abs(v1)) if safe else sympy.exp(v1)
+            sbuf[slot] = sympy.exp(sympy.Min(sympy.Max(v1, -700.0), 700.0)) if safe else sympy.exp(v1)
         elif op == 'log':
             sbuf[slot] = sympy.log(sympy.Abs(v1) + sympy.Float(1e-30)) if safe else sympy.log(v1)
         elif op == 'sqrt':
@@ -6874,7 +6889,7 @@ def tree_to_sympy(cgp_eq, feature_vars, safe=None):
     Convert a CGP expression tree to a SymPy expression.
 
     safe=True   → mirrors SAFE op implementations (abs-wrapping, epsilon guards,
-                  exp becomes exp(-|v|) bounded decay).
+                  exp becomes exp(clip(v, -700.0, 700.0))).
     safe=False  → mirrors UNSAFE op implementations (raw math, no guards).
     safe=None   → uses the current global SAFE_OPS_MODE setting.
 
@@ -6930,9 +6945,20 @@ def tree_to_sympy(cgp_eq, feature_vars, safe=None):
 
             elif node.op == 'pow':
                 if safe:
-                    # |base|^clip(exp,−10,10)
-                    v2c = sympy.Min(sympy.Max(v2, sympy.Float(-10)), sympy.Float(10))
-                    buf[idx] = sympy.Pow(sympy.Abs(v1) + sympy.Float(1e-30), v2c)
+                    # Real pow with sign preservation where possible
+                    v2c = sympy.Min(sympy.Max(v2, sympy.Float(-250.0)), sympy.Float(250.0))
+                    # Check if v2c is a constant integer to preserve sign
+                    try:
+                        v2_float = float(v2c)
+                        if abs(round(v2_float) - v2_float) < 1e-4:
+                            if abs(round(v2_float) % 2) == 1:
+                                buf[idx] = sympy.sign(v1) * sympy.Pow(sympy.Abs(v1) + sympy.Float(1e-30), v2c)
+                            else:
+                                buf[idx] = sympy.Pow(sympy.Abs(v1) + sympy.Float(1e-30), v2c)
+                        else:
+                            buf[idx] = sympy.Pow(sympy.Abs(v1) + sympy.Float(1e-30), v2c)
+                    except Exception:
+                        buf[idx] = sympy.Pow(sympy.Abs(v1) + sympy.Float(1e-30), v2c)
                 else:
                     buf[idx] = sympy.Pow(v1, v2)
 
@@ -7014,8 +7040,7 @@ def tree_to_sympy(cgp_eq, feature_vars, safe=None):
 
             elif node.op == 'exp':
                 if safe:
-                    # safe exp = exp(-|v|)  — bounded decay, NOT the real exp
-                    buf[idx] = sympy.exp(-sympy.Abs(v1))
+                    buf[idx] = sympy.exp(sympy.Min(sympy.Max(v1, sympy.Float(-700.0)), sympy.Float(700.0)))
                 else:
                     buf[idx] = sympy.exp(v1)
 
@@ -7045,7 +7070,7 @@ def tree_to_sympy(cgp_eq, feature_vars, safe=None):
 
             elif node.op == '10^x':
                 if safe:
-                    v1c = sympy.Min(sympy.Max(v1, sympy.Float(-30)), sympy.Float(30))
+                    v1c = sympy.Min(sympy.Max(v1, sympy.Float(-300.0)), sympy.Float(300.0))
                     buf[idx] = sympy.Pow(10, v1c)
                 else:
                     buf[idx] = sympy.Pow(10, v1)
@@ -7295,11 +7320,11 @@ def generate_script(models, dp, filename="best_model.py", X_data=None):
             elif op == '/':
                 lines.append(f"    _buf[{slot}] = _np.where(_np.abs({v2})>1e-8, {v1}/{v2}, 0.0)")
             elif op == 'pow':
-                lines.append(f"    _buf[{slot}] = _np.power(_np.abs({v1})+1e-30, _np.clip({v2},-10,10))")
+                lines.append(f"    _buf[{slot}] = _np.where(_np.abs(_np.round({v2}) - {v2}) < 1e-4, _np.where(_np.abs(_np.mod(_np.round({v2}), 2)) < 1e-8, _np.power(_np.abs({v1}) + 1e-30, _np.clip({v2}, -250.0, 250.0)), _np.copysign(_np.power(_np.abs({v1}) + 1e-30, _np.clip({v2}, -250.0, 250.0)), {v1})), _np.power(_np.abs({v1}) + 1e-30, _np.clip({v2}, -250.0, 250.0)))")
             elif op in ('sin','cos','tan','tanh','abs','sign','floor','ceil'):
                 lines.append(f"    _buf[{slot}] = _np.{op}({v1})")
             elif op == 'exp':
-                lines.append(f"    _buf[{slot}] = _np.exp(-_np.abs({v1}))")
+                lines.append(f"    _buf[{slot}] = _np.exp(_np.clip({v1}, -700.0, 700.0))")
             elif op == 'log':
                 lines.append(f"    _buf[{slot}] = _np.log(_np.abs({v1})+1e-30)")
             elif op == 'sqrt':
@@ -9592,7 +9617,7 @@ def cgp_to_vector(cgp_eq, max_nodes):
 
     The encoding is designed so that:
       • Structurally similar graphs map to nearby vectors.
-      • Constant values are included but clipped to [-10, 10] to prevent
+      • Constant values are included but clipped to [-250.0, 250.0] to prevent
         a single outlier constant from dominating the kernel distance.
     """
     n_feat = cgp_eq.n_features
@@ -9610,7 +9635,7 @@ def cgp_to_vector(cgp_eq, max_nodes):
         vec[base + 1] = node.in1 / max(total_slots - 1, 1)
         vec[base + 2] = node.in2 / max(total_slots - 1, 1)
         # Clipped constant value
-        vec[base + 3] = np.clip(node.const_val, -10.0, 10.0) / 10.0
+        vec[base + 3] = np.clip(node.const_val, -250.0, 250.0) / 10.0
 
     # Normalised output index
     vec[-1] = cgp_eq.out_idx / max(total_slots - 1, 1)
@@ -10990,11 +11015,11 @@ def _generate_boosted_script(boosted_models, dp, X_data=None):
             elif op == '/':
                 lines.append(f"    _buf[{slot}] = _np.where(_np.abs({v2})>1e-8, {v1}/{v2}, 0.0)")
             elif op == 'pow':
-                lines.append(f"    _buf[{slot}] = _np.power(_np.abs({v1})+1e-30, _np.clip({v2},-10,10))")
+                lines.append(f"    _buf[{slot}] = _np.where(_np.abs(_np.round({v2}) - {v2}) < 1e-4, _np.where(_np.abs(_np.mod(_np.round({v2}), 2)) < 1e-8, _np.power(_np.abs({v1}) + 1e-30, _np.clip({v2}, -250.0, 250.0)), _np.copysign(_np.power(_np.abs({v1}) + 1e-30, _np.clip({v2}, -250.0, 250.0)), {v1})), _np.power(_np.abs({v1}) + 1e-30, _np.clip({v2}, -250.0, 250.0)))")
             elif op in ('sin','cos','tan','tanh','abs','sign','floor','ceil'):
                 lines.append(f"    _buf[{slot}] = _np.{op}({v1})")
             elif op == 'exp':
-                lines.append(f"    _buf[{slot}] = _np.exp(-_np.abs({v1}))")
+                lines.append(f"    _buf[{slot}] = _np.exp(_np.clip({v1}, -700.0, 700.0))")
             elif op == 'log':
                 lines.append(f"    _buf[{slot}] = _np.log(_np.abs({v1})+1e-30)")
             elif op == 'sqrt':
